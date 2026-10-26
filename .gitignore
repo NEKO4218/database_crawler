@@ -1,0 +1,28 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Chrome 持久化配置（体积大，且含登录态）
+.chrome_profiles/
+.chrome_profile/
+*.chrome_profile/
+
+# 验证码调试与临时产物
+captcha_debug/
+*.log
+*.tmp
+*.crdownload
+
+# 本地真实凭据（保留 *.example.json）
+CNKI/cnki_unit_credentials.json
+SCI/sci_credentials.json
+
+# 第三方大模型文件（上游仓库同样不跟踪，按需自行下载）
+CNKI/Text_select_captcha/model/*.onnx
+
+# IDE / 系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
