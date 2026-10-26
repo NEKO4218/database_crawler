@@ -1302,6 +1302,20 @@ def is_webvpn_portal_login_url(url):
     return path.startswith('/login')
 
 
+def is_login_page_url(url):
+    """VPN / CAS / 知网统一认证登录页（含新标签里停留的登录页）。"""
+    u = (url or '').strip().lower()
+    if not u:
+        return False
+    if is_webvpn_portal_login_url(u):
+        return True
+    return (
+        '/cas/login' in u
+        or 'login.cnki.net' in u
+        or 'fsso.cnki.net' in u
+    )
+
+
 def is_cnki_host_url(url):
     return 'cnki.net' in (effective_page_url(url) or '').lower()
 
@@ -1450,8 +1464,8 @@ def open_cnki_url(driver, url):
     except Exception:
         landed = inner
 
-    if is_webvpn_portal_login_url(landed) or '/cas/login' in landed.lower():
-        print('直接访问落到 WebVPN 登录页，先完成登录')
+    if is_login_page_url(landed):
+        print('直接访问落到 WebVPN/CAS 登录页，先完成登录')
         try_unit_vpn_login(driver)
         try:
             landed = driver.current_url or landed
@@ -1936,6 +1950,14 @@ def needs_webvpn_login(driver, check_handle=None):
     except Exception:
         pass
     try:
+        # 任一标签停在 VPN/CAS/知网登录页：即使还残留旧知网标签，也必须重新登录
+        for handle in list(driver.window_handles):
+            try:
+                driver.switch_to.window(handle)
+                if is_login_page_url(driver.current_url or ''):
+                    return True
+            except Exception:
+                continue
         if _find_cnki_webvpn_handle(driver):
             return False
         url = ''
@@ -2383,6 +2405,143 @@ def is_cnki_work_page_url(url):
     return is_cnki_search_page_url(url) or is_cnki_results_page_url(url)
 
 
+class SessionLostError(RuntimeError):
+    """登录 / VPN 会话中断，需重建浏览器重新登录。"""
+
+
+LOGIN_LOST_TEXT_MARKERS = (
+    '登录状态可能中断',
+    '重新进行登录',
+    '重新登录',
+    '登录已失效',
+    '登录已过期',
+    '登录状态已失效',
+    '登录状态已过期',
+    '会话已过期',
+    '请先登录',
+    '请登录后',
+    '需要登录后',
+    'session expired',
+    'session has expired',
+    'not logged in',
+)
+
+
+def text_suggests_login_lost(text):
+    """异常信息 / 页面文案是否表示登录失效。"""
+    raw = str(text or '').strip().lower()
+    if not raw:
+        return False
+    compact = raw.replace(' ', '').replace('\u3000', '')
+    for marker in LOGIN_LOST_TEXT_MARKERS:
+        key = marker.lower().replace(' ', '')
+        if key and key in compact:
+            return True
+    return False
+
+
+def page_has_no_results(driver):
+    """结果页正文是否明确显示「无结果」。"""
+    try:
+        body = driver.find_element(By.TAG_NAME, 'body').text or ''
+    except Exception:
+        return False
+    text = body.replace(' ', '')
+    return any(k in text for k in (
+        '没有找到', '暂无数据', '无相关数据', '0条结果',
+        '检索结果：0', '检索结果:0', '未检索到',
+        'no results', 'no records found', '0 results',
+    ))
+
+
+def page_suggests_login_lost(driver, check_handle=None):
+    """当前页是否已掉登录。
+
+    判定顺序：VPN/CAS 登录页 → 结果页骨架缺失时的提示文案 / 登录弹窗。
+    结果页骨架（secondUl/checkAll）存在时视为正常，避免把「未登录页头」误判。
+    """
+    original = None
+    try:
+        original = driver.current_window_handle
+    except Exception:
+        original = None
+    try:
+        if check_handle and check_handle in driver.window_handles:
+            try:
+                driver.switch_to.window(check_handle)
+            except Exception:
+                pass
+        try:
+            url = driver.current_url or ''
+        except Exception:
+            return False
+        if is_cnki_verify_url(url):
+            # 验证码页可能页头仍显示「机构登录」，不能据此判定掉登录
+            return False
+        if is_login_page_url(url):
+            return True
+
+        try:
+            page_ready = bool(
+                driver.find_elements(By.CLASS_NAME, 'secondUl')
+                or driver.find_elements(By.CLASS_NAME, 'checkAll')
+                or driver.find_elements(By.ID, 'gradetxt'))
+        except Exception:
+            page_ready = False
+
+        try:
+            body = driver.find_element(By.TAG_NAME, 'body').text or ''
+        except Exception:
+            body = ''
+        if text_suggests_login_lost(body):
+            return True
+        if page_ready:
+            # 页面骨架正常时，后台残留的登录标签不作为掉线依据；
+            # 但页面上真实弹出机构登录框仍算断线
+            try:
+                if has_unit_login_anywhere(driver):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        # 工作页已无结果骨架：任一标签停在 VPN/CAS/知网登录页都算断线
+        for handle in list(driver.window_handles):
+            try:
+                driver.switch_to.window(handle)
+                if is_login_page_url(driver.current_url or ''):
+                    return True
+            except Exception:
+                continue
+
+        # 再看登录弹窗 / 页头是否提示需要机构登录
+        try:
+            if has_unit_login_anywhere(driver) or needs_unit_ip_login(
+                    driver, check_handle=check_handle):
+                return True
+        except Exception:
+            pass
+        return False
+    finally:
+        if original and original in driver.window_handles:
+            try:
+                driver.switch_to.window(original)
+            except Exception:
+                pass
+
+
+def exception_suggests_login_lost(exc, driver=None, check_handle=None):
+    """异常本身或当前页是否表示登录中断。"""
+    if text_suggests_login_lost(exc):
+        return True
+    if driver is None:
+        return False
+    try:
+        return page_suggests_login_lost(driver, check_handle=check_handle)
+    except Exception:
+        return False
+
+
 def _close_sso_extra_windows(driver, main_handle=None):
     """关闭 FSSO/CAS/IdP 及知网门户首页，保留检索窗。"""
     ensure_single_search_window(driver, prefer_handle=main_handle)
@@ -2791,6 +2950,10 @@ def wait_for_export_dialog(driver, export_handle, save_dir, main_handle, timeout
         driver.switch_to.window(export_handle)
         if driver.find_elements(By.CLASS_NAME, 'row-btns'):
             return True
+        alert_text = dismiss_alerts(driver, timeout=0.2)
+        if text_suggests_login_lost(alert_text):
+            print('导出弹窗加载中提示登录状态中断，需重建浏览器重新登录')
+            return 'restart_browser'
         # 仅登录弹窗才算断线；导出页页头可见不算
         if has_unit_login_anywhere(driver):
             print('导出窗口加载中出现机构登录弹窗，正在重连...')
@@ -2835,10 +2998,16 @@ def sleep_after_export_rate_limit(seconds=None):
 def recreate_browser_after_rate_limit(driver, download_dir, doc_type=None):
     """关闭整个浏览器会话，等待后新建实例并打开检索页。返回新 driver。
 
-    用于导出「请求过于频繁」或验证码连败：仅关导出页无效，必须整浏览器重建，
-    随后由上层重新检索本时段并继续导出题录。
+    用于导出「请求过于频繁」、验证码连败或登录中断：仅关导出页无效，
+    必须整浏览器重建。登录中断时跳过频繁等待，直接重新登录。
     """
     import gc
+    login_lost = False
+    try:
+        if driver is not None and is_driver_alive(driver):
+            login_lost = page_suggests_login_lost(driver)
+    except Exception:
+        login_lost = False
     print('关闭整个浏览器（仅关导出页无法解除频繁限制）...')
     try:
         if driver is not None:
@@ -2847,21 +3016,29 @@ def recreate_browser_after_rate_limit(driver, download_dir, doc_type=None):
         print('关闭浏览器失败:', e)
     cleanup_chrome_profile()
     gc.collect()
-    sleep_after_export_rate_limit()
+    if login_lost:
+        print('检测到登录状态中断：跳过频繁等待，直接重建并重新登录...')
+    else:
+        sleep_after_export_rate_limit()
     new_driver = create_chrome_driver(download_dir)
     open_cnki_url(new_driver, get_adv_search_url(doc_type))
     try:
         new_driver.maximize_window()
     except Exception:
         pass
-    ensure_unit_login_if_needed(
+    login_ok = ensure_unit_login_if_needed(
         new_driver, restore_handle=new_driver.current_window_handle)
     cap = ensure_cnki_captcha_after_nav(
         new_driver, download_dir, new_driver.current_window_handle)
+    still_login = page_suggests_login_lost(
+        new_driver, check_handle=new_driver.current_window_handle)
     if captcha_needs_browser_restart(cap):
         print('浏览器重建后验证码仍连败，将由上层再次重启或记失败')
     elif not cap:
         print('浏览器重建后验证码未通过，将由上层重试')
+    elif still_login or not login_ok:
+        print('浏览器重建后仍停在 WebVPN/CAS 登录页，'
+              '请检查 VPN 凭据/账号状态或会话超时策略；将由上层决定是否记失败')
     else:
         print('浏览器已重建并完成登录/验证码，即将继续导出题录')
     return new_driver
@@ -2881,6 +3058,9 @@ def wait_for_export_file(driver, export_handle, save_dir, main_handle, before_fi
     login_retried = False
     while time.time() < deadline:
         alert_text = dismiss_alerts(driver, timeout=0.3)
+        if text_suggests_login_lost(alert_text):
+            print('导出等待中提示登录状态中断，需重建浏览器重新登录')
+            return 'restart_browser'
         if is_request_too_frequent_text(alert_text):
             print('导出等待中出现「请求过于频繁」')
             return 'rate_limited'
@@ -2970,6 +3150,9 @@ def wait_for_result_page(driver, save_dir=None, main_handle=None, timeout=60):
             page_text = driver.find_element(By.TAG_NAME, 'body').text
         except Exception:
             pass
+        if text_suggests_login_lost(page_text):
+            print('等待结果页时检测到登录状态中断')
+            return 'restart_browser'
         if any(kw in page_text for kw in ('找不到', '没有找到', '暂无数据', '0条结果', '检索结果：0')):
             print('检索结果为空或不存在 perPageDiv')
             return True
@@ -2977,6 +3160,10 @@ def wait_for_result_page(driver, save_dir=None, main_handle=None, timeout=60):
         # 结果列表或全选控件也视为已进入结果页
         if driver.find_elements(By.CLASS_NAME, 'checkAll'):
             return True
+
+        if page_suggests_login_lost(driver, check_handle=main_handle):
+            print('等待结果页时检测到登录中断（VPN/机构登录失效）')
+            return 'restart_browser'
 
         time.sleep(1)
 
@@ -3073,6 +3260,15 @@ def downloadexcel(driver, save_dir, main_handle=None):
         close_export_windows(driver, main_handle=main_handle)
         handles_before.clear()
         handles_before.update(driver.window_handles)
+        # 翻页/登录中断后可能已不在结果页，先等工具栏再判断，避免直接抛 no such element
+        try:
+            WebDriverWait(driver, 10, 0.5).until(
+                EC.presence_of_element_located((By.CLASS_NAME, 'secondUl')))
+        except Exception:
+            if page_suggests_login_lost(driver, check_handle=main_handle):
+                raise SessionLostError(
+                    '导出工具栏 .secondUl 缺失，登录状态已中断')
+            raise
         li_uploadlist = driver.find_element(
             By.CLASS_NAME, 'secondUl').find_elements(By.CSS_SELECTOR, 'li')
         selfdef = li_uploadlist[-1].find_element(By.CSS_SELECTOR, 'a')
@@ -3229,8 +3425,11 @@ def downloadexcel(driver, save_dir, main_handle=None):
         driver.execute_script("arguments[0].click();", download_excel)
         print('已点击导出 Excel，等待下载与验证码...')
 
-        # 点击后立刻检查频繁提示
+        # 点击后立刻检查频繁/登录中断提示
         alert_text = dismiss_alerts(driver, timeout=2.5)
+        if text_suggests_login_lost(alert_text):
+            print('导出时提示登录状态中断，需重建浏览器重新登录')
+            return 'restart_browser'
         rate_hit = is_request_too_frequent_text(alert_text)
         if not rate_hit:
             file_result = wait_for_export_file(
@@ -3256,8 +3455,14 @@ def downloadexcel(driver, save_dir, main_handle=None):
         except Exception:
             pass
         return 'restart_browser'
+    except SessionLostError as e:
+        print('downloadexcel 中止：登录状态已中断，需重建浏览器重新登录:', e)
+        return 'restart_browser'
     except Exception as e:
-        print('downloadexcel 失败:', e)
+        print('downloadexcel 失败:', type(e).__name__, e)
+        if exception_suggests_login_lost(e, driver, check_handle=main_handle):
+            print('检测到登录状态中断，需重建浏览器重新登录')
+            return 'restart_browser'
         if has_unit_login_anywhere(driver) or needs_unit_ip_login(
                 driver, check_handle=main_handle):
             print('导出异常且检测到机构未登录，尝试 IP 登录...')
@@ -3390,11 +3595,11 @@ def run_download_excel_step(driver, save_dir, main_handle):
     返回:
       True              — 导出成功且已选已清空
       False             — 普通失败
-      'restart_browser' — 请求过于频繁，需关闭浏览器重建会话
+      'restart_browser' — 请求过于频繁 / 登录中断，需关闭浏览器重建会话
     """
     result = downloadexcel(driver, save_dir, main_handle)
     if result == 'restart_browser':
-        print('Excel 导出触发频繁限制，请求关闭浏览器')
+        print('Excel 导出中止，需关闭浏览器重建会话（频繁/验证码/登录中断）')
         return 'restart_browser'
     if result is True:
         if main_handle and main_handle in driver.window_handles:
@@ -4777,6 +4982,7 @@ def run_one_search_export(
         f' | {cat_kind}: {cat_label}{theme_part}{date_part} ====='
     )
 
+    main_handle = None
     try:
         # 进入新检索前先关掉残留导出页，避免焦点/句柄错乱
         if driver.window_handles:
@@ -4788,6 +4994,9 @@ def run_one_search_export(
             open_adv_search_in_session(driver, doc_type)
             time.sleep(0.8)
             main_handle = driver.current_window_handle
+            if page_suggests_login_lost(driver, check_handle=main_handle):
+                print(f'{label} 复用会话时检测到登录中断，需重建浏览器重新登录')
+                return 'restart_browser'
             # 仅当页面再次出现验证码时才处理，不主动触发探测链
             try:
                 cur = driver.current_url or ''
@@ -4849,6 +5058,9 @@ def run_one_search_export(
             select_literature_category(
                 driver, category_path, doc_type=doc_type)
         except Exception as e:
+            if exception_suggests_login_lost(e, driver, check_handle=main_handle):
+                print(f'{label} 分类选择时登录中断，需重建浏览器后重试')
+                return 'restart_browser'
             print(f'{label} 分类选择失败，记录并跳过:', e)
             record_export_failure(download_dir, label)
             return 'failed'
@@ -4856,6 +5068,9 @@ def run_one_search_export(
         try:
             set_adv_theme_keyword(driver, theme, doc_type=doc_type)
         except Exception as e:
+            if exception_suggests_login_lost(e, driver, check_handle=main_handle):
+                print(f'{label} 主题设置时登录中断，需重建浏览器后重试')
+                return 'restart_browser'
             print(f'{label} 主题设置失败，记录并跳过:', e)
             record_export_failure(download_dir, label)
             return 'failed'
@@ -4865,6 +5080,9 @@ def run_one_search_export(
                 driver, start_date, end_date,
                 doc_type=doc_type, patent_date_field=patent_date_field)
         except Exception as e:
+            if exception_suggests_login_lost(e, driver, check_handle=main_handle):
+                print(f'{label} 设置日期时登录中断，需重建浏览器后重试')
+                return 'restart_browser'
             print(f'{label} 设置日期失败，记录并跳过:', e)
             record_export_failure(download_dir, label)
             return 'failed'
@@ -4890,6 +5108,9 @@ def run_one_search_export(
             print(f'{label} 结果页验证码连败，需关闭浏览器后重试')
             return 'restart_browser'
         if not sps:
+            if page_suggests_login_lost(driver, check_handle=main_handle):
+                print(f'{label} 结果页未就绪且登录中断，需重建浏览器')
+                return 'restart_browser'
             print(f'{label} 结果页未就绪，记录并跳过')
             record_export_failure(download_dir, label)
             return 'failed'
@@ -4897,6 +5118,9 @@ def run_one_search_export(
         try:
             apply_resource_filter(driver, doc_type=doc_type, lang=lang)
         except Exception as e:
+            if exception_suggests_login_lost(e, driver, check_handle=main_handle):
+                print(f'{label} {doc_type_label(doc_type)}筛选时登录中断，需重建浏览器')
+                return 'restart_browser'
             print(f'{label} {doc_type_label(doc_type)}筛选失败，记录并跳过:', e)
             record_export_failure(download_dir, label)
             return 'failed'
@@ -4904,13 +5128,16 @@ def run_one_search_export(
         main_handle = driver.current_window_handle
         # 导出采集前再确认一次登录
         ensure_unit_login_if_needed(driver, restore_handle=main_handle)
+        if page_suggests_login_lost(driver, check_handle=main_handle):
+            print(f'{label} 导出前检测到登录中断，需重建浏览器')
+            return 'restart_browser'
         status = collect_day_results(
             driver, download_dir, main_handle, day_str=label)
         if status == 'ok':
             print(f'{label} 检索导出完成')
             return 'ok'
         if status == 'restart_browser':
-            print(f'{label} 需关闭浏览器后重试本时段（频繁或验证码连败）')
+            print(f'{label} 需关闭浏览器后重试本时段（频繁/验证码/登录中断）')
             return 'restart_browser'
         if status == 'failed':
             print(f'{label} 导出失败，开始下一个')
@@ -4918,7 +5145,10 @@ def run_one_search_export(
         print(f'{label} 无检索结果，跳过导出')
         return 'empty'
     except Exception as e:
-        print(f'{label} 检索导出异常，记录并跳过:', e)
+        if exception_suggests_login_lost(e, driver, check_handle=main_handle):
+            print(f'{label} 登录状态中断，需重建浏览器后重试本时段:', e)
+            return 'restart_browser'
+        print(f'{label} 检索导出异常，记录并跳过:', type(e).__name__, e)
         try:
             record_export_failure(download_dir, label)
         except Exception:
@@ -5326,14 +5556,24 @@ def run_export_task(driver, task, task_index, task_total):
         driver.maximize_window()
     except Exception:
         pass
-    ensure_unit_login_if_needed(
+    login_ok = ensure_unit_login_if_needed(
         driver, restore_handle=driver.current_window_handle)
     cap0 = ensure_cnki_captcha_after_nav(
         driver, download_dir, driver.current_window_handle)
+    still_login = page_suggests_login_lost(
+        driver, check_handle=driver.current_window_handle)
     # 任务启动已过验证码后，各时段复用会话，不再直连探测跳转
-    session_ready = bool(cap0) and not captcha_needs_browser_restart(cap0)
+    session_ready = (
+        bool(cap0)
+        and not captcha_needs_browser_restart(cap0)
+        and login_ok
+        and not still_login
+    )
     if captcha_needs_browser_restart(cap0) or not cap0:
         print('启动时验证码未通过，将在首段检索中关闭浏览器重试')
+        session_ready = False
+    elif still_login or not login_ok:
+        print('启动时仍停在 WebVPN/CAS 登录页，将在首段检索中重建浏览器并重新登录')
         session_ready = False
     else:
         print('已通过验证码验证，本任务后续时段将复用页面（不再重复滑块）')
@@ -5353,33 +5593,45 @@ def run_export_task(driver, task, task_index, task_total):
                     patent_date_field=patent_date,
                     reuse_session=session_ready)
             except Exception as e:
-                print(f'任务段 {label} 未捕获异常，记录并继续下一段:', e)
-                try:
-                    record_export_failure(download_dir, label)
-                except Exception:
-                    pass
-                status = 'failed'
-                try:
-                    close_export_windows(driver, main_handle=None)
-                    if driver.window_handles:
-                        driver.switch_to.window(driver.window_handles[0])
-                    if session_ready:
-                        open_adv_search_in_session(driver, doc_type)
-                    else:
-                        open_cnki_url(driver, get_adv_search_url(doc_type))
-                    time.sleep(2)
-                except Exception:
-                    pass
+                if exception_suggests_login_lost(e, driver):
+                    print(
+                        f'任务段 {label} 登录状态中断，'
+                        '准备关闭浏览器重新登录后重试本时段:', e)
+                    status = 'restart_browser'
+                else:
+                    print(
+                        f'任务段 {label} 未捕获异常，记录并继续下一段:',
+                        type(e).__name__, e)
+                    try:
+                        record_export_failure(download_dir, label)
+                    except Exception:
+                        pass
+                    status = 'failed'
+                    try:
+                        close_export_windows(driver, main_handle=None)
+                        if driver.window_handles:
+                            driver.switch_to.window(driver.window_handles[0])
+                        if session_ready:
+                            open_adv_search_in_session(driver, doc_type)
+                        else:
+                            open_cnki_url(driver, get_adv_search_url(doc_type))
+                        time.sleep(2)
+                    except Exception:
+                        pass
 
             # 仅失败恢复（频繁/验证码）才重建；正常完成时段不重启
             if status == 'restart_browser' and restart_left > 0:
                 restart_left -= 1
                 print(
                     f'{label} 关闭浏览器并重建'
-                    f'（导出频繁或验证码连败，剩余重建次数 {restart_left}）...')
+                    f'（频繁、验证码或登录中断，剩余重建次数 {restart_left}）...')
                 driver = recreate_browser_after_rate_limit(
                     driver, download_dir, doc_type=doc_type)
-                session_ready = True  # 重建流程内已登录+验证码
+                session_ready = not page_suggests_login_lost(driver)
+                if not session_ready:
+                    print(
+                        f'{label} 重建后仍停在 WebVPN/CAS 登录页，'
+                        '本段将重新走登录流程')
                 print(
                     f'{label} 浏览器已重建，继续导出题录'
                     '（重新检索本时段并导出）...')
@@ -5482,12 +5734,13 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
       'ok'              — 有结果且全部导出成功
       'empty'           — 无检索结果
       'failed'          — 导出失败已中止（已记失败日志）
-      'restart_browser' — 请求过于频繁，需关闭浏览器后重试本时段
+      'restart_browser' — 请求过于频繁 / 验证码连败 / 登录中断，需关浏览器重试本时段
     """
     count = 1
     page_count = 0
     has_results = False
     export_failed = False
+    page_error = False
     need_browser_restart = False
 
     def _do_export(fail_msg='本批导出失败，取消后续导出，开始下一个'):
@@ -5506,9 +5759,26 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
 
     def _export_remainder_and_finish(last_page):
         """翻到末页后导出未满 500 的剩余已选。"""
-        nonlocal export_failed
+        nonlocal export_failed, page_error, need_browser_restart
         rem = last_page % 10
         if not has_results or rem == 0 or export_failed:
+            return
+        selected = get_selected_count(driver)
+        if selected == 0:
+            print(f'末页已选为 0，跳过导出（rem={rem}），记失败交给补全')
+            page_error = True
+            return
+        try:
+            has_toolbar = bool(driver.find_elements(By.CLASS_NAME, 'secondUl'))
+        except Exception:
+            has_toolbar = False
+        if not has_toolbar:
+            if page_suggests_login_lost(driver, check_handle=main_handle):
+                print('末页导出前检测到登录中断，需重建浏览器')
+                need_browser_restart = True
+            else:
+                print('末页导出前未找到导出工具栏，跳过本批并记失败')
+                page_error = True
             return
         print(f'末页处理：导出剩余 {rem} 页（约至第{last_page}页）')
         if not _do_export('末批导出失败'):
@@ -5517,8 +5787,13 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
     while True:
         if need_browser_restart:
             break
-        dismiss_alerts(driver, timeout=0.3)
+        alert_text = dismiss_alerts(driver, timeout=0.3)
         print(f'第{count}页')
+        if text_suggests_login_lost(alert_text) or page_suggests_login_lost(
+                driver, check_handle=main_handle):
+            print('检测到登录状态中断（VPN/机构登录失效），需重建浏览器后重试本时段')
+            need_browser_restart = True
+            break
         if has_captcha_anywhere(driver):
             cap = ensure_captcha_passed(driver, save_dir, main_handle)
             if captcha_needs_browser_restart(cap):
@@ -5554,6 +5829,10 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
             driver.execute_script("arguments[0].click();", selallclick)
             has_results = True
             alert_text = dismiss_alerts(driver, timeout=0.8)
+            if text_suggests_login_lost(alert_text):
+                print('勾选时提示登录状态中断，需重建浏览器后重试本时段')
+                need_browser_restart = True
+                break
             if alert_text and '不能超过500' in alert_text:
                 print('勾选触发超过500上限，优先清空后再重选本页')
                 if not clear_selected_results(driver, main_handle):
@@ -5577,9 +5856,17 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
                     need_browser_restart = True
                     break
                 continue
-            print('当日无更多结果或提取失败:', e)
-            # 当前页未勾选成功：按上一页为末页导出剩余
+            if text_suggests_login_lost(e) or page_suggests_login_lost(
+                    driver, check_handle=main_handle):
+                print('提取失败且登录状态中断，需重建浏览器后重试本时段')
+                need_browser_restart = True
+                break
+            print('当日无更多结果或提取失败:', type(e).__name__, e)
+            # 当前页未勾选成功：先按上一页导出剩余，再判断是正常末页还是页面异常
             _export_remainder_and_finish(count - 1 if count > 1 else 0)
+            if not page_has_no_results(driver):
+                print('页面未正常加载（非明确无结果），本时段记失败，交给补全重导')
+                page_error = True
             break
 
         time.sleep(2)
@@ -5593,6 +5880,10 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
             next_ele = driver.find_element(By.ID, 'Page_next_top')
             driver.execute_script("arguments[0].click();", next_ele)
             alert_text = dismiss_alerts(driver, timeout=0.8)
+            if text_suggests_login_lost(alert_text):
+                print('翻页时提示登录状态中断，需重建浏览器后重试本时段')
+                need_browser_restart = True
+                break
             if alert_text and '不能超过500' in alert_text:
                 print('翻页时提示超过500，优先清空再继续（已导出过则不再导出）')
                 if not clear_selected_results(driver, main_handle):
@@ -5618,6 +5909,11 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
                         clear_selected_results(driver, main_handle)
                         break
                 continue
+            if text_suggests_login_lost(e) or page_suggests_login_lost(
+                    driver, check_handle=main_handle):
+                print('翻页失败且登录状态中断，需重建浏览器后重试本时段')
+                need_browser_restart = True
+                break
             print('翻页结束:', e)
             _export_remainder_and_finish(count)
             break
@@ -5625,7 +5921,7 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
     if need_browser_restart:
         # 不在此处记失败：上层关浏览器重试本时段，成功后再移除记录
         return 'restart_browser'
-    if export_failed:
+    if export_failed or page_error:
         if day_str:
             record_export_failure(save_dir, day_str)
         return 'failed'
@@ -6230,6 +6526,9 @@ def do_search_return_hit(
         open_adv_search_in_session(driver, doc_type)
         time.sleep(0.8)
         main_handle = driver.current_window_handle
+        if page_suggests_login_lost(driver, check_handle=main_handle):
+            print('补全：复用会话时登录已中断，需重建浏览器后重试')
+            return 'restart_browser'
         try:
             cur = driver.current_url or ''
         except Exception:
@@ -6247,6 +6546,9 @@ def do_search_return_hit(
         ensure_unit_login_if_needed(
             driver, restore_handle=driver.current_window_handle)
         main_handle = driver.current_window_handle
+        if page_suggests_login_lost(driver, check_handle=main_handle):
+            print('补全：登录未恢复，需重建浏览器后重试')
+            return 'restart_browser'
         cap = ensure_cnki_captcha_after_nav(driver, download_dir, main_handle)
         if captcha_needs_browser_restart(cap):
             return 'restart_browser'
@@ -6301,6 +6603,9 @@ def export_with_split(
                         patent_date_field=patent_date_field,
                         reuse_session=True)
                 except Exception as e:
+                    if exception_suggests_login_lost(e, driver):
+                        print(f'{label} 子类 {child} 检索时登录中断，需重建浏览器')
+                        return 'restart_browser'
                     print(f'{label} 子类 {child} 检索失败: {e}')
                     record_export_failure(download_dir, label)
                     ok_all = False
@@ -6337,6 +6642,9 @@ def export_with_split(
                         record_export_failure(download_dir, label)
                         break
                 except Exception as e:
+                    if exception_suggests_login_lost(e, driver):
+                        print(f'{label} 子类 {child} 导出时登录中断，需重建浏览器')
+                        return 'restart_browser'
                     print(f'{label} 子类 {child} 导出失败: {e}')
                     ok_all = False
                     record_export_failure(download_dir, label)
@@ -6394,7 +6702,10 @@ def run_fill_one_label(
             doc_type=doc_type, theme=theme,
             patent_date_field=patent_date, reuse_session=reuse_session)
     except Exception as e:
-        print(f'{label} 检索失败，保留失败记录: {e}')
+        if exception_suggests_login_lost(e, driver):
+            print(f'{label} 检索时登录状态中断，需重建浏览器后重试: {e}')
+            return 'restart_browser'
+        print(f'{label} 检索失败，保留失败记录: {type(e).__name__}: {e}')
         record_export_failure(str(download_dir), label)
         return False
     if captcha_needs_browser_restart(hit):
@@ -6502,12 +6813,18 @@ def run_fill_mode(
                     driver.maximize_window()
                 except Exception:
                     pass
-                ensure_unit_login_if_needed(
+                login_ok = ensure_unit_login_if_needed(
                     driver, restore_handle=driver.current_window_handle)
                 cap0 = ensure_cnki_captcha_after_nav(
                     driver, download_dir, driver.current_window_handle)
+                still_login = page_suggests_login_lost(
+                    driver, check_handle=driver.current_window_handle)
                 if captcha_needs_browser_restart(cap0) or not cap0:
                     print('补全启动时验证码未通过，将在时段重试中重建浏览器')
+                    fill_session_ready = False
+                elif still_login or not login_ok:
+                    print('补全启动时仍停在 WebVPN/CAS 登录页，'
+                          '将在时段重试中重建浏览器并重新登录')
                     fill_session_ready = False
                 else:
                     fill_session_ready = True
@@ -6525,10 +6842,13 @@ def run_fill_mode(
                     if fill_result == 'restart_browser':
                         print(
                             f'{label} 补全需关浏览器'
-                            f'（频繁或验证码连败），重建后重试...')
+                            f'（频繁、验证码或登录中断），重建后重试...')
                         driver = recreate_browser_after_rate_limit(
                             driver, download_dir, doc_type=fill_doc_type)
-                        fill_session_ready = True
+                        fill_session_ready = not page_suggests_login_lost(driver)
+                        if not fill_session_ready:
+                            print(f'{label} 重建后仍停在登录页，'
+                                  '本时段将重新走登录流程')
                         fill_result = run_fill_one_label(
                             driver, download_dir, info['category'],
                             info['lang'], label,
