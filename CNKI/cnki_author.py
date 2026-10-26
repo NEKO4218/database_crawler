@@ -5,7 +5,7 @@
 「作者标注」「单位列表」「作者单位对应」写入指定输出目录的 xlsx。
 
 示例：
-  python cnki_author.py
+  python cnki_author.py                 # 默认交互：询问源路径、输出目录等
   python cnki_author.py --folder "D:\\2026年工作\\知网数据库下载\\信息科技"
   python cnki_author.py --folder 英文期刊 --out "D:\\2026年工作\\知网数据库下载\\_作者单位"
   python cnki_author.py --all --workers 12 --limit-files 1 --limit-papers 20
@@ -525,14 +525,153 @@ def process_excel(
     return ok, fail, skip
 
 
+def _split_input_paths(raw: str) -> list[str]:
+    parts = re.split(r'[;；]', raw or '')
+    return [p.strip().strip('"').strip("'") for p in parts if p.strip()]
+
+
+def _resolve_input_path(raw: str) -> Path:
+    """完整路径 / 题录根下的大类名 / 当前目录相对路径。"""
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path
+    by_root = RECORDS_ROOT / raw
+    if by_root.is_dir():
+        return by_root
+    return (Path.cwd() / path).resolve()
+
+
+def _input_line(prompt: str, default: str = '', hint: str | None = None) -> str:
+    if hint is None:
+        hint = f'（回车={default}）' if default else '（直接回车跳过）'
+    raw = input(f'{prompt}{hint}: ').strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+        raw = raw[1:-1].strip()
+    return raw or default
+
+
+def _prompt_int(
+    prompt: str, default: int, minimum: int = 0,
+    maximum: int | None = None,
+) -> int:
+    while True:
+        raw = _input_line(prompt, str(default))
+        try:
+            value = int(raw)
+        except ValueError:
+            print('  请输入整数。')
+            continue
+        if value < minimum or (maximum is not None and value > maximum):
+            bounds = (f'{minimum}..{maximum}' if maximum is not None
+                      else f'>= {minimum}')
+            print(f'  请输入 {bounds} 的整数。')
+            continue
+        return value
+
+
+def _prompt_yes_no(prompt: str, default: bool = True) -> bool:
+    while True:
+        raw = _input_line(prompt, 'Y' if default else 'N').lower()
+        if raw in ('y', 'yes', '是', '1'):
+            return True
+        if raw in ('n', 'no', '否', '0'):
+            return False
+        print('  请输入 y 或 n。')
+
+
+def interactive_setup(args) -> bool:
+    """无命令行参数时，逐项询问源路径、输出目录与抓取参数。"""
+    print('=' * 64)
+    print('知网作者-单位标记（交互模式）')
+    print(f'题录根目录: {RECORDS_ROOT}')
+    available = [p for p in CATEGORY_ROOTS if p.is_dir()]
+    if available:
+        print('可用大类（可输入序号或名称）:')
+        for i, path in enumerate(available, 1):
+            print(f'  {i}. {path.name}')
+        print('多个路径用分号分隔；直接回车处理全部大类。')
+    else:
+        print('题录根目录下暂未找到大类目录，请输入完整路径。')
+
+    while True:
+        raw = _input_line(
+            '源文件夹（完整路径/大类名/序号，多个用分号）',
+            hint='（回车=全部大类，q=取消）').strip()
+        if raw.lower() in ('q', 'quit', 'exit'):
+            return False
+        if not raw:
+            if not available:
+                print('  没有可用的默认大类，请先输入源路径。')
+                continue
+            args.folder = []
+            args.all = True
+            break
+        selected: list[Path] = []
+        invalid: list[Path] = []
+        for item in _split_input_paths(raw):
+            if item.isdigit() and available and 1 <= int(item) <= len(available):
+                selected.append(available[int(item) - 1])
+                continue
+            path = _resolve_input_path(item)
+            if path.is_dir():
+                selected.append(path)
+            else:
+                invalid.append(path)
+        if invalid:
+            for path in invalid:
+                kind = '是文件，请输入目录' if path.is_file() else '不存在'
+                print(f'  {path} {kind}')
+            if selected:
+                print('  已识别有效路径:')
+                for path in selected:
+                    print(f'    {path}')
+            print('  请重新输入源路径。')
+            continue
+        args.folder = [str(path) for path in selected]
+        args.all = False
+        break
+
+    while True:
+        raw = _input_line(
+            '标记结果保存目录', str(args.out),
+            hint=f'（回车={args.out}，q=取消）')
+        if raw.lower() in ('q', 'quit', 'exit'):
+            return False
+        out = Path(raw).expanduser()
+        if out.is_file():
+            print('  该路径是文件，请指定目录。')
+            continue
+        args.out = out if out.is_absolute() else (Path.cwd() / out).resolve()
+        break
+
+    args.workers = _prompt_int('并发请求数（1-64）', args.workers, 1, 64)
+    args.limit_files = _prompt_int(
+        '每个目录最多处理几个 Excel（0=不限）', args.limit_files, 0)
+    args.limit_papers = _prompt_int(
+        '每个 Excel 最多抓几篇（0=不限）', args.limit_papers, 0)
+    args.resume = _prompt_yes_no('跳过已有作者单位标记的条目', True)
+    args.list = _prompt_yes_no('只列出将处理的 Excel，不实际抓取', False)
+
+    print('\n即将执行:')
+    if args.all:
+        print('  源目录: 全部大类')
+    for path in args.folder:
+        print(f'  源目录: {path}')
+    print(f'  输出目录: {args.out}')
+    print(f'  并发: {args.workers}')
+    print(f'  每目录 Excel 上限: {args.limit_files or "不限"}')
+    print(f'  每 Excel 论文上限: {args.limit_papers or "不限"}')
+    print(f'  跳过已有标记: {"是" if args.resume else "否"}')
+    print(f'  只列出: {"是" if args.list else "否"}')
+    return _prompt_yes_no('确认开始', True)
+
+
 def resolve_folders(names: list[str] | None, use_all: bool) -> list[Path]:
     if use_all or not names:
         return [p for p in CATEGORY_ROOTS if p.is_dir()]
     out = []
     for raw in names:
-        path = Path(raw)
-        if not path.is_absolute():
-            path = RECORDS_ROOT / raw
+        path = _resolve_input_path(raw)
         if path.is_dir():
             out.append(path)
         else:
@@ -545,7 +684,7 @@ def parse_args():
     parser.add_argument(
         '--folder', action='append', default=[],
         help='源文件夹（完整路径或题录根下的目录名），可重复')
-    parser.add_argument('--all', action='store_true', help='处理全部七个大类')
+    parser.add_argument('--all', action='store_true', help='处理全部已存在的大类')
     parser.add_argument(
         '--out', type=Path, default=DEFAULT_OUT,
         help=f'标记结果保存根目录（默认 {DEFAULT_OUT}）')
@@ -563,11 +702,16 @@ def parse_args():
 def main() -> int:
     _setup_stdio()
     args = parse_args()
+    interactive = len(sys.argv) == 1
+    if interactive:
+        if not interactive_setup(args):
+            print('已取消')
+            return 0
     folders = resolve_folders(args.folder, args.all)
     if not folders:
         print('未找到可处理目录')
         return 1
-    if '--out' not in sys.argv and not args.list:
+    if '--out' not in sys.argv and not args.list and not interactive:
         raw = input(f'标记结果目录（回车={args.out}）: ').strip().strip('"')
         if raw:
             args.out = Path(raw)
