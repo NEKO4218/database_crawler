@@ -1,0 +1,40 @@
+# Python 3.10-3.12（本仓库在 Python 3.12.3 下验证）
+# 安装：python -m pip install -r requirements.txt
+# 浏览器：Selenium / undetected-chromedriver 需要本机已安装 Chrome
+
+# --- 通用：浏览器自动化与表格处理 ---
+selenium==4.23.1
+undetected-chromedriver==3.5.5
+requests==2.32.2
+pandas==2.2.2
+openpyxl==3.1.5
+xlrd==2.0.1
+python-calamine==0.8.2
+lxml==5.3.2
+beautifulsoup4==4.12.3
+
+# --- CNKI：WebVPN 登录、滑块 / 点选验证码 ---
+pycryptodome==3.20.0
+Pillow==12.2.0
+numpy==1.26.4
+opencv-python==4.6.0.66
+onnxruntime==1.18.1
+ddddocr==1.5.5
+rapidocr-onnxruntime==1.4.4
+
+# --- 可选：CNKI 点选缺口识别的额外回退（会引入 ultralytics + torch，体积较大）---
+# captcha-recognizer==0.6.0
+
+# --- 可选：CNKI GPU 加速（onnxruntime 与 onnxruntime-gpu 二选一）---
+# onnxruntime-gpu==1.24.4
+# torch==2.6.0  # 按本机 CUDA 版本从 https://pytorch.org 安装
+
+# --- 可选：CNKI/Text_select_captcha 验证码服务与演示脚本 ---
+# fastapi==0.115.11
+# uvicorn==0.34.0
+# pydantic==2.8.2
+# aiohttp==3.9.5
+# playwright
+
+# --- 可选：CNKI/test_anticap.py 试验脚本 ---
+# AntiCAP==3.3.5

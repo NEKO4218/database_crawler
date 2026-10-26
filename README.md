@@ -30,7 +30,7 @@ code/
 1. **工作目录**：进入对应子目录再运行脚本（同目录互相 `import` 的模块会一并找到）。
 2. **凭证**：知网见 `CNKI/cnki_unit_credentials*.json`；SCI 见 `SCI/sci_credentials*.json`。请先复制 `*.example.json` 再填写真实账号，勿把含密码的 JSON 提交到公开仓库。
 3. **输出路径**：多数脚本仍使用绝对路径或命令行参数指定下载/导出目录（如「知网数据库下载」「SCI数据库下载」「PubMed题录」「Scopus题录」），与代码目录分离。
-4. **依赖**：Selenium、Chrome、pandas/openpyxl、requests 等按脚本提示安装；知网验证码另依赖 OCR / 滑块相关库。
+4. **依赖**：在仓库根目录执行 `python -m pip install -r requirements.txt`（Python 3.10-3.12，另需本机安装 Chrome）。知网 GPU 验证码、`Text_select_captcha` 服务及 AntiCAP 试验所需的可选依赖见文件内注释。
 
 ## 其他
 
