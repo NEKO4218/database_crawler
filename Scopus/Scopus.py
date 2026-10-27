@@ -50,10 +50,42 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # 基本配置（命令行参数会覆盖这里）
 # ---------------------------------------------------------------------------
+_SCRIPT_DIR = Path(__file__).resolve().parent
+CREDENTIALS_FILE = _SCRIPT_DIR / "scopus_credentials.json"
+
+
+def load_credentials() -> dict:
+    """从 scopus_credentials.json 读取 API Key。按列表顺序检查；用尽后自动换下一把。"""
+    defaults: dict = {"api_keys": [], "inst_token": ""}
+    if not CREDENTIALS_FILE.is_file():
+        print(f"未找到凭据文件: {CREDENTIALS_FILE}，请复制 scopus_credentials.example.json")
+        return defaults
+    try:
+        data = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"读取 Scopus 凭据失败: {exc}")
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    keys: list[str] = []
+    raw_keys = data.get("api_keys", data.get("api_key", []))
+    if isinstance(raw_keys, str):
+        raw_keys = [raw_keys]
+    if isinstance(raw_keys, list):
+        for item in raw_keys:
+            text = str(item or "").strip()
+            if text and text not in keys:
+                keys.append(text)
+    return {
+        "api_keys": keys,
+        "inst_token": str(data.get("inst_token") or "").strip(),
+    }
+
+
+_CREDS = load_credentials()
 # 按列表顺序检查。启动时选用检索配额高于保留量的密钥；用尽后自动换下一把。
-API_KEYS = [
-]
-INST_TOKEN = ""
+API_KEYS = _CREDS["api_keys"]
+INST_TOKEN = _CREDS["inst_token"]
 
 # 检索起止日期（含首尾），格式 YYYY-MM-DD。这里是入库日，不是出版年。
 BGDATE = "2023-01-01"
@@ -878,6 +910,16 @@ def parse_page(results: dict) -> list[dict]:
     return rows
 
 
+def search_total(results: dict) -> int | None:
+    raw = results.get("opensearch:totalResults")
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class Store:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -987,6 +1029,13 @@ class Store:
                 """,
                 (job_key, f"{index:03d}", query, count),
             )
+        self.conn.commit()
+
+    def update_shard_expected(self, job_key: str, shard_key: str, expected: int) -> None:
+        self.conn.execute(
+            "UPDATE shards SET expected_count = ? WHERE job_key = ? AND shard_key = ?",
+            (expected, job_key, shard_key),
+        )
         self.conn.commit()
 
     def mark_shard(self, job_key: str, shard_key: str, status: str, next_start: int | None = None) -> None:
@@ -1249,30 +1298,46 @@ def fetch_shard(api: ScopusAPI, store: Store, out_dir: Path, label: str, with_ab
         store.mark_shard(job_key, shard_key, "done", 0)
         return
     start = next_start
-    log(f"  分段 {shard_key} 共 {expected} 条，从第 {start + 1} 条继续")
-    while start < expected:
+    live_expected = expected
+    log(f"  分段 {shard_key} 共 {live_expected} 条，从第 {start + 1} 条继续")
+    while start < live_expected:
         if start >= OFFSET_LIMIT:
             raise SystemExit(f"分段 {shard_key} 超过偏移上限 {OFFSET_LIMIT}: {query}")
-        page_size = min(api.page_size, expected - start)
+        page_size = min(api.page_size, live_expected - start)
         results = api.search(query, start, page_size)
+        live_total = search_total(results)
+        if live_total is not None and live_total != live_expected:
+            log(f"  分段 {shard_key} 现网总量 {live_total}（规划 {live_expected}）")
+            live_expected = live_total
+            store.update_shard_expected(job_key, shard_key, live_expected)
+            if start >= live_expected:
+                break
         rows = parse_page(results)
-        if len(rows) < page_size:
+        if not rows:
+            if start >= live_expected:
+                break
+            raise RuntimeError(f"分段 {shard_key} 第 {start} 条起返回空页")
+        if len(rows) < page_size and start + len(rows) < live_expected:
             raise RuntimeError(
                 f"分段 {shard_key} 第 {start} 条起期望 {page_size} 条，实际 {len(rows)}"
             )
+        if len(rows) < page_size:
+            log(f"  分段 {shard_key} 末页 {len(rows)} 条，按现网总量 {live_expected} 收齐")
         store.save_records(job_key, shard_key, rows)
-        start += page_size
+        start += len(rows)
         store.mark_shard(job_key, shard_key, "paging", start)
-        log(f"  分段 {shard_key} 进度 {start}/{expected}")
+        log(f"  分段 {shard_key} 进度 {start}/{live_expected}")
         if with_abstract:
             fill_abstracts(api, store, job_key)
         flush_excel(store, job_key, out_dir, label, final=False, require_abstract=with_abstract)
     saved = store.shard_count(job_key, shard_key)
-    if saved != expected:
+    if saved < live_expected:
         store.mark_shard(job_key, shard_key, "pending", 0)
         raise RuntimeError(
-            f"分段 {shard_key} 核对失败: 应有 {expected}，已保存 {saved}，将按 EID 从头再取缺失记录"
+            f"分段 {shard_key} 核对失败: 应有 {live_expected}，已保存 {saved}，将按 EID 从头再取缺失记录"
         )
+    if saved > live_expected:
+        log(f"  分段 {shard_key} 唯一 EID {saved}，多于现网 {live_expected}，按已保存记录完成")
     store.mark_shard(job_key, shard_key, "done", start)
 
 
@@ -1362,15 +1427,26 @@ def run_unit(api: ScopusAPI, store: Store, out_dir: Path, label: str, query: str
                 log(f"  {last_error}，重取本页（{attempt}/{MAX_RETRIES}）")
                 time.sleep(min(30, 2 ** attempt))
                 row = store.conn.execute(
-                    "SELECT next_start FROM shards WHERE job_key = ? AND shard_key = ?",
+                    """
+                    SELECT expected_count, next_start FROM shards
+                    WHERE job_key = ? AND shard_key = ?
+                    """,
                     (job_key, shard_key),
                 ).fetchone()
-                next_start = row[0] if row else next_start
+                if row:
+                    shard_total, next_start = row
         else:
             raise SystemExit(f"{label} 分段 {shard_key} 未取全: {last_error}")
     saved = store.distinct_saved([job_key])
     if saved != expected:
-        raise SystemExit(f"{label} 核对失败: 应有 {expected}，已保存唯一 EID {saved}")
+        live = api.count(query)
+        if saved == live:
+            log(f"{label} 现网命中 {live}，与原计划 {expected} 不一致，按现网完成")
+            expected = live
+        elif saved < live:
+            raise SystemExit(f"{label} 核对失败: 应有 {live}，已保存唯一 EID {saved}")
+        else:
+            log(f"{label} 唯一 EID {saved}，多于现网命中 {live}。分段之间允许交叉，导出仍按 EID 去重。")
     if with_abstract:
         fill_abstracts(api, store, job_key)
     written = flush_excel(store, job_key, out_dir, label, final=True, require_abstract=with_abstract)

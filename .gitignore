@@ -17,6 +17,8 @@ captcha_debug/
 # 本地真实凭据（保留 *.example.json）
 CNKI/cnki_unit_credentials.json
 SCI/sci_credentials.json
+PubMed/pubmed_credentials.json
+Scopus/scopus_credentials.json
 
 # 第三方大模型文件（上游仓库同样不跟踪，按需自行下载）
 CNKI/Text_select_captcha/model/*.onnx

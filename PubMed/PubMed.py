@@ -41,9 +41,35 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # 基本配置（命令行参数会覆盖这里）
 # ---------------------------------------------------------------------------
-API_KEY = ""
-EMAIL = ""
+_SCRIPT_DIR = Path(__file__).resolve().parent
+CREDENTIALS_FILE = _SCRIPT_DIR / "pubmed_credentials.json"
 TOOL = "PubMed.py"
+
+
+def load_credentials() -> dict:
+    """从 pubmed_credentials.json 读取 API Key。"""
+    defaults = {"api_key": "", "email": ""}
+    if not CREDENTIALS_FILE.is_file():
+        print(f"未找到凭据文件: {CREDENTIALS_FILE}，请复制 pubmed_credentials.example.json")
+        return defaults
+    try:
+        data = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"读取 PubMed 凭据失败: {exc}")
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    out = dict(defaults)
+    if "api_key" in data:
+        out["api_key"] = str(data["api_key"] or "").strip()
+    if "email" in data:
+        out["email"] = str(data["email"] or "").strip()
+    return out
+
+
+_CREDS = load_credentials()
+API_KEY = _CREDS["api_key"]
+EMAIL = _CREDS["email"]
 
 # 检索起止日期（含首尾），格式 YYYY-MM-DD
 BGDATE = "2024-01-01"
