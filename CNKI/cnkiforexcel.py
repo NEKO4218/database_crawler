@@ -3243,6 +3243,24 @@ def set_result_page_size(driver, page_size=50, save_dir=None, main_handle=None):
             By.CSS_SELECTOR, f'.sort-list li[data-val="{page_size}"] a')
         driver.execute_script("arguments[0].click();", option)
         time.sleep(3)
+        # 验证每页条数是否真正生效，避免专利页仍按大页数累计已选
+        try:
+            per_page_divs = driver.find_elements(By.ID, 'perPageDiv')
+            if per_page_divs:
+                current = per_page_divs[0].find_element(
+                    By.CSS_SELECTOR, '.sort-default span').text.strip()
+                if current != str(page_size):
+                    print(f'每页条数未生效（当前 {current}），重试一次')
+                    sort_default = per_page_divs[0].find_element(
+                        By.CLASS_NAME, 'sort-default')
+                    driver.execute_script("arguments[0].click();", sort_default)
+                    time.sleep(1)
+                    option = per_page_divs[0].find_element(
+                        By.CSS_SELECTOR, f'.sort-list li[data-val="{page_size}"] a')
+                    driver.execute_script("arguments[0].click();", option)
+                    time.sleep(3)
+        except Exception as e:
+            print('验证每页条数失败:', e)
         return True
     except Exception as e:
         print('设置每页条数失败:', e)
@@ -6004,6 +6022,16 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
         if not _do_export('末批导出失败'):
             pass
 
+    # 开始采集前先清理上一轮残留已选，避免第 1 页起就达到 500 条上限
+    try:
+        initial_selected = get_selected_count(driver)
+    except Exception:
+        initial_selected = None
+    if initial_selected is not None and initial_selected > 0:
+        print(f'采集开始前检测到残留已选 {initial_selected} 条，先导出并清空')
+        _do_export('采集开始前残留批次导出失败')
+        clear_selected_results(driver, main_handle)
+
     while True:
         if need_browser_restart:
             break
@@ -6031,14 +6059,14 @@ def collect_day_results(driver, save_dir, main_handle, day_str=None):
         # 若上次清空失败导致已选仍满 500：优先清空，避免把同一批再导出一遍
         selected = get_selected_count(driver)
         if selected is not None and selected >= 500:
-            print(f'检测到已选 {selected} 条（达上限），优先清空避免重复导出')
-            if clear_selected_results(driver, main_handle):
-                continue
-            print('直接清空失败，再尝试导出+清空（可能产生重复文件）')
-            if not _do_export():
+            print(f'检测到已选 {selected} 条（达上限），先导出当前批次再清空，避免丢数据或重复导出')
+            if not _do_export('已选达上限，先导出当前批次'):
                 clear_selected_results(driver, main_handle)
                 break
-            page_count = count
+            if not clear_selected_results(driver, main_handle):
+                print('导出成功但清空已选失败，本时段记失败')
+                page_error = True
+                break
             continue
 
         try:
