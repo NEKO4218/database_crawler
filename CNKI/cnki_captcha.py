@@ -482,10 +482,46 @@ def _tencent_slider_solvable(driver):
     return False
 
 
+def _tencent_wrap_text(driver):
+    """腾讯验证码弹窗内的可见文案，用于识别成功/错误提示。"""
+    texts = []
+    selectors = (
+        '#tCaptchaDyMainWrap',
+        '.tencent-captcha-dy__warp',
+        '[class*="tencent-captcha-dy"]',
+    )
+    for css in selectors:
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, css):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    text = (el.text or el.get_attribute('innerText') or '').strip()
+                except Exception:
+                    continue
+                if text and text not in texts:
+                    texts.append(text)
+        except Exception:
+            continue
+    return ' '.join(texts)
+
+
 def _tencent_success_ui_visible(driver):
     if is_cnki_verify_done_page(driver):
         return True
     if _css_any_displayed(driver, '.tencent-captcha-dy__verify-status-img--success'):
+        return True
+    for css in (
+            '[class*="tencent-captcha-dy"][class*="success"]',
+            '[class*="verify-status"][class*="success"]',
+            '[class*="verify-success"]'):
+        if _css_any_displayed(driver, css):
+            return True
+    text = _tencent_wrap_text(driver)
+    compact = text.replace(' ', '')
+    if compact and any(k in compact for k in (
+            '验证成功', '验证通过', '通过验证', '成功验证',
+            '验证完成', '已通过验证', '已通过')):
         return True
     try:
         for el in driver.find_elements(
@@ -548,6 +584,27 @@ def is_tencent_slider_captcha(driver):
     if _tencent_success_ui_visible(driver):
         return False
     return _tencent_slider_solvable(driver)
+
+
+def has_visible_captcha_widget(driver):
+    """页面上是否仍有可交互的验证码控件（不依赖 URL）。"""
+    selectors = (
+        '.tencent-captcha-dy__slider-block',
+        '.verify-sub-block',
+        '.verify-img-panel img',
+        '.verifybox',
+    )
+    for css in selectors:
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, css):
+                try:
+                    if el.is_displayed():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
 
 
 def wait_for_tencent_slider(driver, timeout=12):
@@ -709,8 +766,11 @@ def click_tencent_confirm(driver):
     """滑块对齐后需点「确定」才会开始下载。"""
     selectors = (
         '.tencent-captcha-dy__verify-confirm-btn',
-        '[class*="verify-confirm-btn"]',
+        '[class*="verify-confirm"]',
+        '[class*="tencent-captcha-dy"] button',
+        '.tencent-captcha-dy__warp button',
     )
+    confirm_words = ('确定', '确认', '继续', '提交', '完成', 'ok')
     for css in selectors:
         try:
             btns = driver.find_elements(By.CSS_SELECTOR, css)
@@ -722,6 +782,15 @@ def click_tencent_confirm(driver):
                 if 'disabled' in cls:
                     continue
                 if not btn.is_displayed():
+                    continue
+                text = (btn.text or btn.get_attribute('innerText') or '').strip()
+                is_confirm_cls = any(
+                    k in cls for k in ('confirm', 'submit', 'sure'))
+                if text:
+                    if text.lower() not in confirm_words and not any(
+                            w in text for w in confirm_words):
+                        continue
+                elif not is_confirm_cls:
                     continue
                 driver.execute_script('arguments[0].click();', btn)
                 print('    ✓ 已点击验证「确定」')
@@ -1047,55 +1116,66 @@ def solve_tencent_slider(driver, save_dir=None, download_dir=None, before_files=
         print(f'    ✗ 拖动滑块失败: {e}')
         return False
     print('    ✓ 已释放腾讯滑块', flush=True)
-    time.sleep(0.85)
-    if is_cnki_verify_done_page(driver):
-        print('    ✓ 验证完成，已进入下载')
-        click_verify_done_close(driver)
-        return True
-    err_text = tencent_feedback_text(driver)
-    if is_tencent_rate_limited(driver):
-        _set_tencent_last_fail('rate_limit')
-        print(f'    ✗ 腾讯滑块过于频繁{("：" + err_text) if err_text else ""}')
-        return False
-    if is_tencent_slider_error(driver):
-        _set_tencent_last_fail('verify_error')
-        print(f'    ✗ 腾讯滑块验证错误{("：" + err_text) if err_text else ""}')
-        _wait_tencent_after_fail(driver)
-        return False
+    time.sleep(0.6)
     click_tencent_confirm(driver)
+    last_confirm = time.time()
 
-    if download_dir:
-        ok = wait_tencent_pass_by_download(
-            driver, download_dir, before_files, timeout=TENCENT_DOWNLOAD_WAIT)
-        if ok:
-            return True
-        if is_tencent_rate_limited(driver):
-            _set_tencent_last_fail('rate_limit')
-            print('    ✗ 腾讯滑块过于频繁')
-            return False
-        if is_tencent_slider_error(driver):
-            _set_tencent_last_fail('verify_error')
-            print('    ✗ 腾讯滑块验证错误')
-            _wait_tencent_after_fail(driver)
-            return False
-        _set_tencent_last_fail('no_pass')
-        print('    ✗ 滑动后未通过（无成功态且无下载文件）')
-        return False
-
-    if is_tencent_slider_error(driver):
-        _set_tencent_last_fail('verify_error')
-        print('    ✗ 腾讯滑块验证错误')
-        _wait_tencent_after_fail(driver)
-        return False
-    click_tencent_confirm(driver)
-    deadline = time.time() + 6
+    # 腾讯成功态不一定有固定成功图标：滑块消失、弹窗关闭、URL 离开验证页都算通过
+    deadline = time.time() + (TENCENT_DOWNLOAD_WAIT if download_dir else 12)
+    gone_since = None
+    saw_success = False
     while time.time() < deadline:
-        if is_cnki_verify_done_page(driver) or is_tencent_slider_success(
-                driver, initial_url):
+        if has_new_download_file(download_dir, before_files):
+            print('    ✓ 已检测到新下载文件，判定验证通过')
+            return True
+        if is_cnki_verify_done_page(driver):
             print('    ✓ 验证完成，已进入下载')
             click_verify_done_close(driver)
             return True
-        time.sleep(0.3)
+        err_text = tencent_feedback_text(driver)
+        if is_tencent_rate_limited(driver):
+            _set_tencent_last_fail('rate_limit')
+            print(f'    ✗ 腾讯滑块过于频繁{("：" + err_text) if err_text else ""}')
+            return False
+        if is_tencent_slider_error(driver):
+            _set_tencent_last_fail('verify_error')
+            print(f'    ✗ 腾讯滑块验证错误{("：" + err_text) if err_text else ""}')
+            _wait_tencent_after_fail(driver)
+            return False
+        if _tencent_success_ui_visible(driver):
+            saw_success = True
+            click_tencent_confirm(driver)
+            print('    ✓ 腾讯滑块已显示成功')
+            return True
+        try:
+            current_url = driver.current_url or ''
+        except Exception:
+            current_url = initial_url
+        if is_cnki_verify_url(initial_url) and not is_cnki_verify_url(current_url):
+            print('    ✓ 已离开验证页，判定验证通过')
+            return True
+        if not _tencent_slider_solvable(driver):
+            gone_since = gone_since or time.time()
+            if time.time() - gone_since >= 2.0:
+                print('    ✓ 腾讯滑块控件已消失且无错误提示，判定验证通过')
+                return True
+        else:
+            gone_since = None
+        if time.time() - last_confirm >= 1.5:
+            click_tencent_confirm(driver)
+            last_confirm = time.time()
+        time.sleep(0.25)
+
+    if has_new_download_file(download_dir, before_files):
+        print('    ✓ 已检测到新下载文件，判定验证通过')
+        return True
+    if saw_success:
+        print('    ✓ 腾讯滑块已显示成功（弹窗未关）')
+        return True
+    if download_dir and not _tencent_slider_solvable(driver):
+        # 已无滑块可操作，下载交给上层 wait_pdf_or_unavailable 继续等待
+        print('    ✓ 腾讯滑块已不可操作，交由下载等待确认文件')
+        return True
     _set_tencent_last_fail('no_pass')
     print('    ✗ 腾讯滑块未出现成功提示')
     return False
@@ -1803,6 +1883,15 @@ def preload_text_select_captcha():
 def solve_captcha(driver, save_dir=None, download_dir=None, before_files=None):
     """按验证码类型自动选择处理方式。"""
     captcha_type = get_captcha_type(driver)
+    if not captcha_type:
+        if is_cnki_verify_done_page(driver) or _tencent_success_ui_visible(driver):
+            print('验证码已完成')
+            return True
+        if not has_visible_captcha_widget(driver):
+            print('未找到可交互验证码控件，按已通过处理')
+            return True
+        print('未知验证码类型')
+        return False
     if captcha_type == 'tencent_slider':
         return solve_tencent_slider(
             driver, save_dir, download_dir=download_dir, before_files=before_files)

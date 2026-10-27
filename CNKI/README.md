@@ -47,7 +47,8 @@
 
 | 字段 | 说明 |
 |------|------|
-| `doc_type` | `journal`（学术期刊）或 `patent`（专利库 `classid=VUDIXAIY`） |
+| `doc_type` | `journal`（学术期刊）、`patent`（专利库 `classid=VUDIXAIY`）或 `none`（不选，跳过结果页资源类型筛选） |
+| `lang` | `zh`=中文、`en`=英文、`none`=不选（跳过检索页/结果页中/外文筛选） |
 | `category` | 期刊=学科导航；专利=国际专利分类 IPC（如 `['G','G06']`） |
 | `theme` | 可选主题；专利写入第2行「主题」(SU)，不填「公开号」 |
 | `patent_date` | 专利：`AD`=申请日 / `OD`=公开日（默认申请日） |
@@ -58,7 +59,10 @@
 ```bash
 python cnkiforexcel.py --doc-type patent
 python cnkiforexcel.py --doc-type journal
+python cnkiforexcel.py --doc-type none   # 不选导出类型，跳过资源类型筛选
 ```
+
+选择「不选」时：`doc_type=none` 不点 JOURNAL/PATENT；`lang=none` 不勾选中/外文，也不点结果页语言 tab。
 
 专利结果保存到 `DOWNLOAD_ROOT/专利/...`；带主题时目录名会追加主题后缀。
 

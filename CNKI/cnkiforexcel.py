@@ -28,6 +28,7 @@ from cnki_captcha import (
     get_captcha_type,
     has_block_puzzle,
     has_new_download_file,
+    has_visible_captcha_widget,
     is_cnki_verify_url,
     is_tencent_rate_limited,
     preload_click_captcha,
@@ -58,9 +59,9 @@ DOWNLOAD_ROOT = r'D:\2026年工作\知网数据库下载'
 # 检索粒度：'day'=按天 | 'month'=按月 | 'year'=按年 | 'all'=整段一次
 # 不足一个月/一年的尾段自动截到 initdate
 CRAWL_GRANULARITY = 'all'
-# 下载类型：'zh'=中文 | 'en'=英文（交互配置时可改；EXPORT_TASKS 未写 lang 时用此默认）
+# 下载类型：'zh'=中文 | 'en'=英文 | 'none'=不选（跳过中/外文筛选）
 DOWNLOAD_LANG = 'zh'
-# 导出文献类型默认：'journal'=学术期刊 | 'patent'=专利
+# 导出文献类型默认：'journal'=学术期刊 | 'patent'=专利 | 'none'=不选（跳过资源类型筛选）
 DOWNLOAD_DOC_TYPE = 'journal'
 # 可选默认主题词（空=不限制；交互配置时作为默认提示，任务可覆盖）
 DEFAULT_THEME = ''
@@ -98,11 +99,12 @@ WEBVPN_ADV_SEARCH_PATH = '/kns8s/AdvSearch'
 
 # 预定义导出任务列表（可选）。为空则启动时交互配置多个任务。
 # 每项字段：
-#   category   : 期刊=学科导航如 ['基础科学','数学']；专利=IPC 如 ['G','G06']
-#   doc_type   : journal / patent（可省略，默认 DOWNLOAD_DOC_TYPE）
+#   category   : 期刊=学科导航如 ['基础科学','数学']；专利=IPC 如 ['G','G06']；
+#                doc_type=none 时不选分类，可省略或 []
+#   doc_type   : journal / patent / none（不选=跳过分类勾选+结果页资源类型筛选；可省略）
 #   theme      : 可选主题词（专利写入「主题」行，默认第2行已是 SU）
 #   patent_date: 专利时间字段 AD=申请日 / OD=公开日（默认 AD）
-#   lang       : zh / en（仅期刊）
+#   lang       : zh / en / none（不选=跳过中/外文筛选；专利任务忽略）
 #   granularity / bgdate / initdate : 同前
 EXPORT_TASKS = [
     # {
@@ -785,6 +787,12 @@ def handle_captcha(
             print('验证码弹窗仍在，但已检测到下载文件，判定通过')
             ok = True
             break
+        # 滑块实际已通过但成功提示未识别时，控件会消失；不要把它当成失败
+        time.sleep(0.6)
+        if not has_visible_captcha_widget(driver):
+            print('验证码控件已消失，按已通过处理')
+            ok = True
+            break
         last_fp = fp_before
         if attempt < max_retries:
             if tencent_last_fail() == 'rate_limit' or is_tencent_rate_limited(driver):
@@ -1373,8 +1381,10 @@ def to_cnki_access_url(url):
 
 
 def normalize_doc_type(doc_type):
-    """journal / patent。"""
+    """journal / patent / none（不选，跳过资源类型筛选）。"""
     value = (doc_type or DOWNLOAD_DOC_TYPE or 'journal').strip().lower()
+    if value in ('none', 'any', 'all', '不选', '不限', '全部'):
+        return 'none'
     if value in (
             'patent', 'pat', '专利权', '专利', 'zl',
             'vudi', PATENT_CLASSID.lower()):
@@ -1383,13 +1393,18 @@ def normalize_doc_type(doc_type):
 
 
 def doc_type_label(doc_type):
-    return '专利' if normalize_doc_type(doc_type) == 'patent' else '期刊'
+    normalized = normalize_doc_type(doc_type)
+    if normalized == 'patent':
+        return '专利'
+    if normalized == 'none':
+        return '不选'
+    return '期刊'
 
 
 def get_adv_search_url(doc_type=None):
     """高级检索页。VPN 模式改写为学校 WebVPN 地址。
 
-    doc_type=patent 时打开 classid=VUDIXAIY 专利检索；否则期刊总库高级检索。
+    doc_type=patent 时打开 classid=VUDIXAIY 专利检索；journal/none 用总库高级检索。
     """
     doc_type = normalize_doc_type(doc_type)
     if doc_type == 'patent':
@@ -1453,6 +1468,21 @@ def open_cnki_url(driver, url):
             return raw
 
     inner = unwrap_webvpn_url(raw)
+    inner_l = inner.lower()
+    if '/kcms2/article/abstract' in inner_l or '/kcms/detail' in inner_l:
+        # 文章详情页已知真实地址，直连通常被校园网/VPN 拦截，直接走 WebVPN
+        vpn_url = to_webvpn_url(inner)
+        print(f'文章详情页直接走 WebVPN: {_short_url(vpn_url)}')
+        try:
+            driver.get(vpn_url)
+        except Exception as e:
+            print('WebVPN 文章页打开未完成:', e)
+        wait_url_settle(driver)
+        try:
+            return driver.current_url or vpn_url
+        except Exception:
+            return vpn_url
+
     print(f'先直接访问以获取落地域名: {_short_url(inner)}')
     try:
         driver.get(inner)
@@ -1530,6 +1560,16 @@ def ensure_cnki_captcha_after_nav(driver, save_dir, main_handle=None):
         url = ''
     if not (is_cnki_verify_url(url) or has_captcha_anywhere(driver)):
         return True
+    if is_cnki_verify_url(url) and not has_visible_captcha_widget(driver):
+        print('验证页暂未出现可交互控件，等待跳转...')
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            if has_visible_captcha_widget(driver):
+                break
+            time.sleep(0.4)
+        else:
+            print('验证页未出现可交互控件，按已通过处理')
+            return True
     print(f'跳转后出现验证码，开始处理: {_short_url(url)}')
     wait_for_any_captcha_widget(driver, timeout=12)
     cap = ensure_captcha_passed(driver, save_dir, main_handle)
@@ -3959,16 +3999,21 @@ def _normalize_meta_entry(item):
     """规范化 export_meta.json 中的一条任务参数。"""
     if not isinstance(item, dict):
         return None
+    doc_type = normalize_doc_type(item.get('doc_type'))
     category = item.get('category') or item.get('category_path')
     if isinstance(category, str):
         category = [
             p.strip() for p in category.replace('>', '/').split('/')
             if p.strip()
         ]
-    if not category or not isinstance(category, list):
+    if category is None:
+        category = []
+    if not isinstance(category, list):
+        return None
+    if not category and doc_type != 'none':
         return None
     return {
-        'doc_type': normalize_doc_type(item.get('doc_type')),
+        'doc_type': doc_type,
         'lang': normalize_lang(item.get('lang')),
         'category': list(category),
         'theme': (item.get('theme') or '').strip(),
@@ -4244,18 +4289,28 @@ def _set_literature_lang_checkbox(driver, data_id, want_checked):
 
 def normalize_lang(lang):
     value = (lang or DOWNLOAD_LANG or 'zh').strip().lower()
+    if value in ('none', 'any', 'all', '不选', '不限', '全部'):
+        return 'none'
     if value in ('en', 'english', '英文', 'foreign', '外文'):
         return 'en'
     return 'zh'
 
 
 def lang_label(lang):
-    return '英文' if normalize_lang(lang) == 'en' else '中文'
+    normalized = normalize_lang(lang)
+    if normalized == 'en':
+        return '英文'
+    if normalized == 'none':
+        return '不选'
+    return '中文'
 
 
 def prepare_adv_search_page(driver, lang=None):
-    """高级检索页预处理：按下载类型勾选中文或外文文献。"""
+    """高级检索页预处理：按下载类型勾选中文或外文文献；不选则跳过。"""
     lang = normalize_lang(lang)
+    if lang == 'none':
+        print('下载类型：不选，跳过检索页中/外文筛选')
+        return
     if lang == 'en':
         print('检索范围：仅外文文献')
         if not click_foreign_filter(driver, timeout=15, stage='检索前'):
@@ -4313,17 +4368,26 @@ def click_chinese_filter(driver, timeout=20, stage='结果页'):
         '中文', timeout, stage)
 
 
-def apply_journal_filter(driver, lang=None):
-    """检索后按下载类型点中文/外文，再选择学术期刊。"""
+def apply_lang_filter(driver, lang=None):
+    """结果页按下载类型点中文/外文；下载类型=不选时跳过。"""
     lang = normalize_lang(lang)
+    if lang == 'none':
+        print('下载类型：不选，跳过结果页中/外文筛选')
+        return
     if lang == 'en':
         if not click_foreign_filter(driver, stage='结果页'):
             raise RuntimeError('结果页外文筛选失败')
-        print('只选择学术期刊（英文）')
+        print('结果页只保留外文')
     else:
         if not click_chinese_filter(driver, timeout=3, stage='结果页'):
-            print('结果页未点到中文按钮，继续仅选学术期刊')
-        print('只选择学术期刊（中文）')
+            print('结果页未点到中文按钮，继续后续筛选')
+        print('结果页只保留中文')
+
+
+def apply_journal_filter(driver, lang=None):
+    """检索后按下载类型点中文/外文，再选择学术期刊；不选则跳过语言筛选。"""
+    apply_lang_filter(driver, lang)
+    print('只选择学术期刊')
     journal = WebDriverWait(driver, 20, 0.5).until(
         EC.element_to_be_clickable((By.CSS_SELECTOR, 'a[resource="JOURNAL"]')))
     driver.execute_script("arguments[0].click();", journal)
@@ -4365,12 +4429,17 @@ def apply_patent_filter(driver):
 
 
 def apply_resource_filter(driver, doc_type=None, lang=None):
-    """按导出类型筛选结果。
+    """按导出类型筛选结果；导出类型=不选时跳过整个资源类型筛选。
 
-    期刊：中/外文 + 学术期刊(JOURNAL)。
+    期刊：中/外文（下载类型不选时跳过）+ 学术期刊(JOURNAL)。
     专利：已在 classid=VUDIXAIY 专利库检索，结果页通常无 JOURNAL/PATENT 切换，默认跳过。
     """
-    if normalize_doc_type(doc_type) == 'patent':
+    doc_type = normalize_doc_type(doc_type)
+    if doc_type == 'none':
+        print('导出类型：不选，跳过结果页资源类型筛选')
+        apply_lang_filter(driver, lang)
+        return True
+    if doc_type == 'patent':
         print('专利库结果页：跳过期刊式资源类型筛选')
         return True
     apply_journal_filter(driver, lang=lang)
@@ -4500,8 +4569,11 @@ def set_adv_theme_keyword(driver, theme, doc_type=None):
 
 
 def prompt_literature_category(doc_type=None):
-    """控制台逐级选分类。期刊=学科；专利=国际专利分类 IPC。"""
+    """控制台逐级选分类。期刊=学科；专利=国际专利分类 IPC；不选则跳过。"""
     doc_type = normalize_doc_type(doc_type)
+    if doc_type == 'none':
+        print('导出类型：不选，跳过文献分类(学科导航)选择')
+        return []
     path = []
     node = get_category_tree(doc_type)
     title = '国际专利分类(IPC)' if doc_type == 'patent' else '文献分类(学科导航)'
@@ -4571,23 +4643,41 @@ def prompt_patent_date_field(default=None):
 def category_path_to_dirname(category_path):
     """文献分类路径转为目录名。"""
     if isinstance(category_path, str):
-        return category_path
+        return category_path or '不限分类'
+    if not category_path:
+        return '不限分类'
     return '_'.join(category_path)
+
+
+def category_path_label(category_path, doc_type=None):
+    """分类路径显示名；导出类型不选或无路径时显示「不限分类」。"""
+    doc_type = normalize_doc_type(doc_type)
+    if isinstance(category_path, str):
+        category_path = [category_path] if category_path.strip() else []
+    category_path = list(category_path or [])
+    if doc_type == 'none' or not category_path:
+        return '不限分类'
+    if doc_type == 'patent':
+        return ' / '.join(ipc_display_name(p) for p in category_path)
+    return ' / '.join(category_path)
 
 
 def task_download_dir(task):
     """按下载类型确定保存目录。
 
     期刊中文：大类或分类路径；英文：英文期刊/分类；
-    专利：专利/分类[_主题]。
+    专利：专利/分类[_主题]；导出类型不选：不限分类[_主题]。
     """
-    category_path = task['category']
+    category_path = task.get('category') or []
     category_dir = category_path_to_dirname(category_path)
     theme = (task.get('theme') or '').strip()
     if theme:
         # 主题写入子目录名，避免不同主题互相覆盖
         safe_theme = re.sub(r'[\\/:*?"<>|]+', '_', theme)[:40]
-        category_dir = f'{category_dir}_{safe_theme}'
+        if category_dir == '不限分类':
+            category_dir = safe_theme
+        else:
+            category_dir = f'{category_dir}_{safe_theme}'
     if normalize_doc_type(task.get('doc_type')) == 'patent':
         return os.path.join(DOWNLOAD_ROOT, '专利', category_dir)
     if normalize_lang(task.get('lang')) == 'en':
@@ -4640,7 +4730,7 @@ def switch_category_nav_tab(driver, doc_type=None):
         return True
 
     # 期刊：无 IPC tab → 默认学科；或 #CNKI168 已可见 → 直接用
-    if doc_type == 'journal':
+    if doc_type != 'patent':
         ipc_tabs = driver.find_elements(
             By.CSS_SELECTOR, f'.top-tabs a[data-href="{PATENT_IPC_NAV_ID}"]')
         if not ipc_tabs:
@@ -4675,8 +4765,8 @@ def switch_category_nav_tab(driver, doc_type=None):
         except Exception as e:
             last_err = e
 
-    # 期刊兜底：tab 点不到但 DOM 有 CNKI168 仍继续
-    if doc_type == 'journal' and driver.find_elements(By.ID, JOURNAL_NAV_ID):
+    # 期刊/不选类型兜底：tab 点不到但 DOM 有 CNKI168 仍继续
+    if doc_type != 'patent' and driver.find_elements(By.ID, JOURNAL_NAV_ID):
         print('未点到学科导航 tab，仍使用默认 #CNKI168')
         return JOURNAL_NAV_ID
     raise RuntimeError(f'无法切换到「{tab_title}」: {last_err}')
@@ -4701,6 +4791,19 @@ def clear_category_nav_selection(driver):
     return False
 
 
+def _element_text(el):
+    try:
+        text = (el.text or '').strip()
+    except Exception:
+        text = ''
+    if not text:
+        try:
+            text = (el.get_attribute('textContent') or '').strip()
+        except Exception:
+            text = ''
+    return text
+
+
 def _category_token_match(name, li=None, link=None):
     want = (name or '').strip()
     if not want:
@@ -4714,7 +4817,7 @@ def _category_token_match(name, li=None, link=None):
         pass
     try:
         if link is not None:
-            text = (link.text or '').strip()
+            text = _element_text(link)
     except Exception:
         pass
     if want == code or want == text:
@@ -4724,9 +4827,15 @@ def _category_token_match(name, li=None, link=None):
         return True
     if code and want.upper() == code.upper():
         return True
-    if code and label and want.replace(' ', '') in (
-            f'{code}{label}'.replace(' ', ''),
-            f'{code} {label}'.replace(' ', '')):
+    if code:
+        # IPC 子节点可能没有 name 属性，只能靠链接文本前缀匹配
+        if re.match(rf'^{re.escape(code)}(?![A-Za-z0-9])', text, re.I):
+            return True
+        if label and want.replace(' ', '') in (
+                f'{code}{label}'.replace(' ', ''),
+                f'{code} {label}'.replace(' ', '')):
+            return True
+    if re.match(rf'^{re.escape(want)}(?![A-Za-z0-9])', text, re.I):
         return True
     return False
 
@@ -4767,6 +4876,24 @@ def _find_any_category(scope_el, name):
     return None, None, None
 
 
+def _child_container(li):
+    """li 的直接子级容器；兼容 ul 外包一层 div 的结构。"""
+    for xpath in (
+            './ul',
+            './div/ul',
+            './div[contains(@class,"sub-nav")]',
+            './div[contains(@class,"sub")]',
+            './div[contains(@class,"child")]',
+            './div[contains(@class,"list")]'):
+        try:
+            els = li.find_elements(By.XPATH, xpath)
+        except Exception:
+            continue
+        if els:
+            return els[0]
+    return None
+
+
 def _find_nav_item_along_path(driver, path, root_id=None):
     """从分类根节点按路径层层定位。"""
     root_id = root_id or JOURNAL_NAV_ID
@@ -4781,92 +4908,130 @@ def _find_nav_item_along_path(driver, path, root_id=None):
             li, item_nav, link = _find_any_category(scope, name)
         if li is None:
             return None, None, None
-        child_uls = li.find_elements(By.XPATH, './ul')
-        if child_uls:
-            scope = child_uls[0]
-        else:
-            scope = li
+        child = _child_container(li)
+        scope = child if child is not None else li
     return li, item_nav, link
 
 
 def _child_ul_visible(li):
-    """判断 li 下子 ul 是否已展开可见。"""
-    child_uls = li.find_elements(By.XPATH, './ul')
-    if not child_uls:
+    """判断 li 下子列表是否已展开可见。"""
+    container = _child_container(li)
+    if container is None:
         return False
-    ul = child_uls[0]
     try:
-        display = (ul.value_of_css_property('display') or '').lower()
+        return bool(container.is_displayed())
+    except Exception:
+        pass
+    try:
+        display = (container.value_of_css_property('display') or '').lower()
         if display == 'none':
             return False
     except Exception:
         pass
-    style = (ul.get_attribute('style') or '').replace(' ', '').lower()
+    style = (container.get_attribute('style') or '').replace(' ', '').lower()
     if 'display:none' in style:
+        return False
+    cls = (container.get_attribute('class') or '').lower()
+    if 'hide' in cls or 'hidden' in cls:
         return False
     return True
 
 
-def _expand_nav_item(driver, li, item_nav, expect_child_name=None, timeout=8):
-    """点击 i.icon 展开子分类，并等待子列表可见（或期望子节点出现）。"""
-    icons = item_nav.find_elements(By.CSS_SELECTOR, 'i.icon')
-    if not icons:
-        print(f'节点无可展开 icon: {item_nav.find_element(By.CSS_SELECTOR, "a.navi-search").text.strip()}')
-        return False
-
-    name = item_nav.find_element(By.CSS_SELECTOR, 'a.navi-search').text.strip()
-    already_open = (
-        'is-down' in (item_nav.get_attribute('class') or '')
-        and _child_ul_visible(li)
-    )
+def _expand_nav_item(driver, li, item_nav, expect_child_name=None, timeout=10):
+    """展开分类节点。兼容 IPC 树：icon 无响应时点父节点，最后强制显示子容器。"""
+    try:
+        link = item_nav.find_element(By.CSS_SELECTOR, 'a.navi-search')
+        name = _element_text(link)
+    except Exception:
+        link = None
+        name = ''
 
     def child_ready():
-        if not _child_ul_visible(li):
+        container = _child_container(li)
+        if container is None or not _child_ul_visible(li):
             return False
-        if expect_child_name:
-            child_uls = li.find_elements(By.XPATH, './ul')
-            if not child_uls:
-                return False
-            c_li, _, _ = _find_direct_child_category(child_uls[0], expect_child_name)
-            if c_li is None:
-                c_li, _, _ = _find_any_category(child_uls[0], expect_child_name)
-            return c_li is not None
-        # 至少出现一个子链接触发点
-        child_uls = li.find_elements(By.XPATH, './ul')
-        if not child_uls:
-            return False
-        return bool(child_uls[0].find_elements(By.CSS_SELECTOR, 'a.navi-search'))
+        if not expect_child_name:
+            return bool(container.find_elements(By.CSS_SELECTOR, 'a.navi-search'))
+        c_li, _, _ = _find_direct_child_category(container, expect_child_name)
+        if c_li is None:
+            c_li, _, _ = _find_any_category(container, expect_child_name)
+        if c_li is not None:
+            return True
+        # 子列表已展开但名称未匹配上：交给调用方全树兜底，避免反复点击把树收起
+        return bool(container.find_elements(By.CSS_SELECTOR, 'a.navi-search'))
 
-    if already_open and child_ready():
+    if child_ready():
         return True
 
+    icons = []
+    try:
+        icons = item_nav.find_elements(By.CSS_SELECTOR, 'i.icon')
+    except Exception:
+        pass
+    arrow = None
+    for icon in icons:
+        try:
+            cls = (icon.get_attribute('class') or '').lower()
+        except Exception:
+            continue
+        if any(k in cls for k in ('arrow', 'down', 'up', 'plus', 'minus', 'expand')):
+            arrow = icon
+            break
+    targets = []
+    if arrow is not None:
+        targets.append(arrow)
+    elif icons:
+        targets.append(icons[0])
+    targets.append(item_nav)
+    if link is not None:
+        targets.append(link)
+
     for attempt in range(1, 4):
+        target = targets[(attempt - 1) % len(targets)]
         try:
             driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});", item_nav)
-            driver.execute_script("arguments[0].click();", icons[0])
+                "arguments[0].scrollIntoView({block:'center'});", target)
+            if attempt == 1:
+                driver.execute_script("arguments[0].click();", target)
+            else:
+                try:
+                    target.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", target)
         except Exception as e:
             print(f'展开点击失败({name}) 第{attempt}次:', e)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            try:
-                # 展开后 DOM 可能刷新，重新取 class
-                item_nav = li.find_element(By.XPATH, './div[contains(@class,"item-nav")]')
-            except Exception:
-                pass
             if child_ready():
                 print(f'已展开分类节点: {name}')
                 return True
             time.sleep(0.3)
-        print(f'展开等待超时({name}) 第{attempt}次，重试点击 icon')
+        print(f'展开等待超时({name}) 第{attempt}次，重试点击')
 
+    # 最后兜底：直接展开子容器（部分 IPC 节点的 icon 点击不触发）
+    container = _child_container(li)
+    if container is not None:
+        try:
+            driver.execute_script(
+                "var e=arguments[0]; if(!e) return;"
+                "e.style.display='block'; e.style.visibility='visible';"
+                "e.classList.remove('hide','hidden');", container)
+            time.sleep(0.6)
+            if child_ready():
+                print(f'已强制展开分类节点: {name}')
+                return True
+        except Exception:
+            pass
     print(f'展开分类失败: {name}')
     return False
 
 
 def select_literature_category(driver, category_path, doc_type=None):
-    """按路径选择分类。专利用国际专利分类 IPC；期刊用学科导航。"""
+    """按路径选择分类。专利用国际专利分类 IPC；期刊用学科导航；不选则跳过。"""
     doc_type = normalize_doc_type(doc_type)
+    if doc_type == 'none':
+        print('导出类型：不选，跳过文献分类(学科导航)选择')
+        return
     if isinstance(category_path, str):
         category_path = [category_path]
     if not category_path:
@@ -4916,6 +5081,18 @@ def select_literature_category(driver, category_path, doc_type=None):
 
         if li is None:
             root = driver.find_element(By.ID, root_id)
+            if doc_type == 'patent':
+                # IPC 树有时靠样式隐藏子级，强制展开所有 ul 后再全树查找
+                try:
+                    driver.execute_script(
+                        "arguments[0].querySelectorAll("
+                        "'ul, div[class*=\"sub\"], div[class*=\"list\"]')"
+                        ".forEach(function(u){"
+                        "u.style.display='block';"
+                        "u.classList.remove('hide','hidden');});", root)
+                    time.sleep(0.4)
+                except Exception:
+                    pass
             li, item_nav, _link = _find_any_category(root, name)
             if li is not None:
                 print(f'警告: 以全树兜底方式找到「{name}」')
@@ -4965,20 +5142,20 @@ def run_one_search_export(
     doc_type = normalize_doc_type(doc_type)
     theme = (theme or '').strip()
     patent_date_field = normalize_patent_date_field(patent_date_field)
-    if isinstance(category_path, list):
-        cat_label = (
-            ' / '.join(ipc_display_name(p) for p in category_path)
-            if doc_type == 'patent' else ' / '.join(category_path))
-    else:
-        cat_label = category_path
+    cat_label = category_path_label(category_path, doc_type)
     theme_part = f' | 主题: {theme}' if theme else ''
     date_part = (
         f' | {patent_date_field_label(patent_date_field)}'
         if doc_type == 'patent' else '')
-    cat_kind = '国际专利分类' if doc_type == 'patent' else '学科导航'
+    if doc_type == 'none':
+        cat_kind = '分类'
+    elif doc_type == 'patent':
+        cat_kind = '国际专利分类'
+    else:
+        cat_kind = '学科导航'
     print(
         f'\n===== 开始检索: {label} | {doc_type_label(doc_type)}'
-        f'{"/" + lang_label(lang) if doc_type == "journal" else ""}'
+        f'{"/" + lang_label(lang) if doc_type != "patent" else ""}'
         f' | {cat_kind}: {cat_label}{theme_part}{date_part} ====='
     )
 
@@ -5046,7 +5223,7 @@ def run_one_search_export(
                     print(f'{label} 打开检索页后验证码未通过，记录并跳过')
                     record_export_failure(download_dir, label)
                     return 'failed'
-        if doc_type == 'journal':
+        if doc_type != 'patent':
             prepare_adv_search_page(driver, lang)
         else:
             prepare_patent_search_page(driver)
@@ -5054,14 +5231,45 @@ def run_one_search_export(
                 '专利检索：IPC + 主题行(SU) + '
                 f'{patent_date_field_label(patent_date_field)}'
                 '（已跳过期刊中/外文与 JOURNAL 筛选）')
-        try:
-            select_literature_category(
-                driver, category_path, doc_type=doc_type)
-        except Exception as e:
-            if exception_suggests_login_lost(e, driver, check_handle=main_handle):
-                print(f'{label} 分类选择时登录中断，需重建浏览器后重试')
+        # 重置条件/展开侧栏后验证码可能延迟弹出，选分类前再确认一次
+        time.sleep(1.0)
+        if has_captcha_anywhere(driver):
+            print(f'{label} 选分类前检测到验证码，先处理')
+            cap = ensure_cnki_captcha_after_nav(
+                driver, download_dir, main_handle)
+            if captcha_needs_browser_restart(cap):
+                print(f'{label} 选分类前验证码连败，需关闭浏览器后重试')
                 return 'restart_browser'
-            print(f'{label} 分类选择失败，记录并跳过:', e)
+            if not cap:
+                print(f'{label} 选分类前验证码未通过，记录并跳过')
+                record_export_failure(download_dir, label)
+                return 'failed'
+        category_done = False
+        for category_attempt in range(1, 3):
+            try:
+                select_literature_category(
+                    driver, category_path, doc_type=doc_type)
+                category_done = True
+                break
+            except Exception as e:
+                if exception_suggests_login_lost(
+                        e, driver, check_handle=main_handle):
+                    print(f'{label} 分类选择时登录中断，需重建浏览器后重试')
+                    return 'restart_browser'
+                if category_attempt == 1 and has_captcha_anywhere(driver):
+                    print(f'{label} 选分类时出现验证码，处理后重试分类')
+                    cap = ensure_cnki_captcha_after_nav(
+                        driver, download_dir, main_handle)
+                    if captcha_needs_browser_restart(cap):
+                        print(f'{label} 选分类时验证码连败，需关闭浏览器后重试')
+                        return 'restart_browser'
+                    if cap:
+                        continue
+                print(f'{label} 分类选择失败，记录并跳过:', e)
+                record_export_failure(download_dir, label)
+                return 'failed'
+        if not category_done:
+            print(f'{label} 分类选择未完成，记录并跳过')
             record_export_failure(download_dir, label)
             return 'failed'
 
@@ -5212,11 +5420,12 @@ def granularity_label(granularity):
 
 
 def prompt_download_lang(default=None):
-    """控制台选择下载类型：中文/英文，默认中文。"""
+    """控制台选择下载类型：中文/英文/不选（不选中/外文筛选）。"""
     default = normalize_lang(default or DOWNLOAD_LANG)
     options = [
         ('1', 'zh', '中文'),
         ('2', 'en', '英文'),
+        ('3', 'none', '不选'),
     ]
     default_key = '1'
     for key, value, _label in options:
@@ -5228,6 +5437,7 @@ def prompt_download_lang(default=None):
     for key, _value, label in options:
         mark = ' (默认)' if key == default_key else ''
         print(f'  {key}. {label}{mark}')
+    print('  说明：选择「不选」将跳过检索页/结果页的中/外文筛选。')
     while True:
         choice = input(f'请选择下载类型编号（直接回车用默认 {default_key}）: ').strip()
         if not choice:
@@ -5291,11 +5501,12 @@ def prompt_task_date_range(default_bg=None, default_end=None):
 
 
 def prompt_doc_type(default=None):
-    """控制台选择导出文献类型：期刊 / 专利。"""
+    """控制台选择导出文献类型：期刊 / 专利 / 不选（跳过资源类型筛选）。"""
     default = normalize_doc_type(default or DOWNLOAD_DOC_TYPE)
     options = [
         ('1', 'journal', '学术期刊题录'),
         ('2', 'patent', '专利题录'),
+        ('3', 'none', '不选'),
     ]
     default_key = '1'
     for key, value, _label in options:
@@ -5306,6 +5517,7 @@ def prompt_doc_type(default=None):
     for key, _value, label in options:
         mark = ' (默认)' if key == default_key else ''
         print(f'  {key}. {label}{mark}')
+    print('  说明：选择「不选」将跳过结果页资源类型筛选。')
     while True:
         choice = input(f'请选择导出类型编号（直接回车用默认 {default_key}）: ').strip()
         if not choice:
@@ -5334,15 +5546,21 @@ def normalize_export_task(task, index=None):
     """规范化单个导出任务字典。"""
     if not isinstance(task, dict):
         raise ValueError(f'任务格式错误: {task!r}')
+    doc_type = normalize_doc_type(
+        task.get('doc_type') or task.get('type') or DOWNLOAD_DOC_TYPE)
     category = task.get('category') or task.get('category_path')
     if isinstance(category, str):
         category = [p.strip() for p in category.replace('>', '/').split('/') if p.strip()]
-    if not category or not isinstance(category, list):
+    if category is None:
+        category = []
+    if not isinstance(category, list):
+        raise ValueError(f'任务 category 格式错误: {task!r}')
+    if doc_type == 'none':
+        category = []
+    elif not category:
         raise ValueError(f'任务缺少 category 路径: {task!r}')
     granularity = task.get('granularity') or CRAWL_GRANULARITY
     lang = normalize_lang(task.get('lang') or DOWNLOAD_LANG)
-    doc_type = normalize_doc_type(
-        task.get('doc_type') or task.get('type') or DOWNLOAD_DOC_TYPE)
     theme = (task.get('theme') or task.get('keyword') or task.get('su') or '').strip()
     patent_date = normalize_patent_date_field(
         task.get('patent_date') or task.get('patent_date_field')
@@ -5369,12 +5587,12 @@ def print_export_tasks(tasks):
     """打印任务列表摘要。"""
     print(f'\n======== 导出任务列表（共 {len(tasks)} 个）========')
     for i, task in enumerate(tasks, 1):
-        if normalize_doc_type(task.get('doc_type')) == 'patent':
-            cat = ' / '.join(ipc_display_name(p) for p in task['category'])
+        doc_type = normalize_doc_type(task.get('doc_type'))
+        cat = category_path_label(task.get('category'), doc_type)
+        if doc_type == 'patent':
             date_kind = patent_date_field_label(task.get('patent_date'))
         else:
-            cat = ' / '.join(task['category'])
-            date_kind = '发表'
+            date_kind = '日期' if doc_type == 'none' else '发表'
         theme = task.get('theme') or ''
         theme_part = f' | 主题:{theme}' if theme else ''
         print(
@@ -5394,10 +5612,10 @@ def prompt_export_tasks():
     print('\n开始配置导出任务列表（可添加多个分类/粒度组合）')
     doc_type = prompt_doc_type(DOWNLOAD_DOC_TYPE)
     download_lang = 'zh'
-    if doc_type == 'journal':
-        download_lang = prompt_download_lang(DOWNLOAD_LANG)
-    else:
+    if doc_type == 'patent':
         print('专利导出默认中文语种设置')
+    else:
+        download_lang = prompt_download_lang(DOWNLOAD_LANG)
     while True:
         print(f'\n----- 添加第 {len(tasks) + 1} 个任务 -----')
         granularity = prompt_crawl_granularity(CRAWL_GRANULARITY)
@@ -5425,7 +5643,8 @@ def prompt_export_tasks():
             f'{lang_label(task["lang"])} | '
             f'{granularity_label(task["granularity"])} | '
             f'{task["bgdate"]}~{task["initdate"]} | '
-            f'{" / ".join(task["category"])}{theme_part}'
+            f'{category_path_label(task["category"], task["doc_type"])}'
+            f'{theme_part}'
         )
 
         while True:
@@ -5446,7 +5665,9 @@ def prompt_export_tasks():
             if cont in ('d', 'del', 'delete'):
                 if tasks:
                     removed = tasks.pop()
-                    print(f'已删除: {" / ".join(removed["category"])}')
+                    print(
+                        f'已删除: '
+                        f'{category_path_label(removed.get("category"), removed.get("doc_type"))}')
                 else:
                     print('列表为空')
                 if not tasks:
@@ -5523,12 +5744,11 @@ def run_export_task(driver, task, task_index, task_total):
     write_export_meta(download_dir, task)
 
     theme_part = f' | 主题: {theme}' if theme else ''
+    cat_part = category_path_label(category_path, doc_type)
     if doc_type == 'patent':
-        cat_part = ' / '.join(ipc_display_name(p) for p in category_path)
         date_kind = patent_date_field_label(patent_date)
     else:
-        cat_part = ' / '.join(category_path)
-        date_kind = '发表'
+        date_kind = '日期' if doc_type == 'none' else '发表'
     print(
         f'\n######## 任务 {task_index}/{task_total}: {task.get("name", "")} ########\n'
         f'类型: {doc_type_label(doc_type)}/{lang_label(lang)} | '
@@ -6554,7 +6774,7 @@ def do_search_return_hit(
             return 'restart_browser'
         if not cap:
             return None
-    if doc_type == 'journal':
+    if doc_type != 'patent':
         prepare_adv_search_page(driver, lang)
     else:
         prepare_patent_search_page(driver)
@@ -6584,12 +6804,18 @@ def do_search_return_hit(
 def export_with_split(
         driver, download_dir, category_path, label, start, end, hit_count, lang,
         main_handle, doc_type=None, theme=None, patent_date_field=None):
-    """超6000则按子类拆分；叶子超限写入 export_over_6000.txt。返回 True=已处理。"""
+    """超6000则按子类拆分；叶子超限写入 export_over_6000.txt。返回 True=已处理。
+
+    导出类型=不选时未勾选学科，无法按子类拆分，超限直接记入 over_6000。
+    """
     doc_type = normalize_doc_type(doc_type)
     theme = (theme or '').strip()
     patent_date_field = normalize_patent_date_field(patent_date_field)
     if hit_count is not None and hit_count > SEARCH_HIT_LIMIT:
-        children = category_children(category_path, doc_type=doc_type)
+        # 不选类型未使用学科导航，不能按子类拆分
+        children = (
+            [] if doc_type == 'none'
+            else category_children(category_path, doc_type=doc_type))
         if children:
             print(f'{label} 共 {hit_count} 条，拆 {len(children)} 个子类')
             ok_all = True
@@ -6886,9 +7112,14 @@ if __name__ == "__main__":
     _parser.add_argument('--limit', type=int, default=0, help='每个目录最多补N个时段，0=全部')
     _parser.add_argument('--dry-run', action='store_true', help='只列队不检索')
     _parser.add_argument(
-        '--doc-type', choices=('journal', 'patent'), default=None,
-        help='默认导出类型（EXPORT_TASKS 为空且交互未选时作为默认；'
+        '--doc-type', choices=('journal', 'patent', 'none'), default=None,
+        help='默认导出类型（journal/patent/none=不选跳过资源类型筛选；'
+             'EXPORT_TASKS 为空且交互未选时作为默认；'
              '补全模式作为目录无法识别时的兜底）')
+    _parser.add_argument(
+        '--lang', choices=('zh', 'en', 'none'), default=None,
+        help='默认下载类型（zh/en/none=不选跳过中外文筛选；'
+             '交互配置时作为默认；专利任务仍固定中文设置）')
     _parser.add_argument(
         '--patent-date', choices=('AD', 'OD'), default=None,
         help='补全模式专利时间字段兜底：AD=申请日（默认），OD=公开日')
@@ -6898,6 +7129,8 @@ if __name__ == "__main__":
     _args, _ = _parser.parse_known_args()
     if _args.doc_type:
         DOWNLOAD_DOC_TYPE = _args.doc_type
+    if _args.lang:
+        DOWNLOAD_LANG = _args.lang
     if _args.theme is not None:
         DEFAULT_THEME = _args.theme.strip()
     if _args.fill:

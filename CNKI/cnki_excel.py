@@ -49,6 +49,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from cnki_captcha import (
     TENCENT_RATE_LIMIT_SLEEP,
     TENCENT_RELOGIN_RETRIES,
+    has_visible_captcha_widget,
     preload_click_captcha,
     tencent_last_fail,
 )
@@ -57,7 +58,6 @@ from cnkiforexcel import (
     ensure_cnki_captcha_after_nav,
     ensure_unit_login_if_needed,
     get_login_home_url,
-    has_captcha_anywhere,
     has_unit_login_anywhere,
     is_cnki_404_url,
     is_driver_alive,
@@ -1072,6 +1072,30 @@ def find_verify_anywhere(driver) -> bool:
     return found
 
 
+def has_visible_captcha_anywhere(driver) -> bool:
+    """任意标签页是否有可交互验证码控件（已通过的验证页不算）。"""
+    current = None
+    try:
+        current = driver.current_window_handle
+    except Exception:
+        pass
+    found = False
+    for handle in list(driver.window_handles):
+        try:
+            driver.switch_to.window(handle)
+            if has_visible_captcha_widget(driver):
+                found = True
+                break
+        except Exception:
+            continue
+    if current and current in driver.window_handles:
+        try:
+            driver.switch_to.window(current)
+        except Exception:
+            pass
+    return found
+
+
 def find_unavailable_anywhere(driver) -> bool:
     current = None
     try:
@@ -1251,7 +1275,7 @@ def wait_pdf_or_unavailable(
             candidate = newest
             time.sleep(0.4)
             continue
-        if has_captcha_anywhere(driver):
+        if has_visible_captcha_anywhere(driver):
             print('    下载过程出现验证码，开始处理...')
             if not save_dir:
                 return 'captcha', None
@@ -1313,7 +1337,7 @@ def pass_captcha_and_login(
     cap0 = ensure_cnki_captcha_after_nav(driver, str(save_dir), main_handle)
     if captcha_needs_browser_restart(cap0) or not cap0:
         return False
-    if has_captcha_anywhere(driver):
+    if has_visible_captcha_anywhere(driver):
         dl = str(download_dir) if download_dir else None
         cap = ensure_captcha_passed(
             driver, str(save_dir), main_handle,
@@ -1677,8 +1701,8 @@ def download_paper(
 
             wait_for_new_window(driver, before_handles, timeout=8)
             time.sleep(1.0)
-            if has_captcha_anywhere(driver) or has_unit_login_anywhere(driver):
-                if has_captcha_anywhere(driver):
+            if has_visible_captcha_anywhere(driver) or has_unit_login_anywhere(driver):
+                if has_visible_captcha_anywhere(driver):
                     print('    检测到下载验证码页，开始处理...')
                 if not pass_captcha_and_login(
                     driver, debug_dir, main_handle,
