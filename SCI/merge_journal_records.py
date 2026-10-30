@@ -232,6 +232,7 @@ def main() -> int:
                     "合并前行数": 0,
                     "去重行数": 0,
                     "合并后行数": 0,
+                    "数据条数": 0,
                     "去重列": "",
                     "状态": "跳过领域",
                     "输出": "",
@@ -254,6 +255,7 @@ def main() -> int:
                 "合并前行数": 0,
                 "去重行数": 0,
                 "合并后行数": 0,
+                "数据条数": 0,
                 "去重列": "",
                 "状态": "",
                 "输出": "",
@@ -269,13 +271,17 @@ def main() -> int:
             if args.resume and dest.exists() and dest.stat().st_size > 0:
                 row["状态"] = "已存在"
                 row["输出"] = str(dest)
+                try:
+                    existing = read_table(dest)
+                    n = len(existing)
+                    row["合并后行数"] = n
+                    row["数据条数"] = n
+                    if not args.no_domain:
+                        domain_frames.append(existing)
+                except Exception as exc:
+                    print(f"    读取已有合并表失败: {exc}")
                 summary_rows.append(row)
-                print(f"  跳过（已存在）: {journal}")
-                if not args.no_domain:
-                    try:
-                        domain_frames.append(read_table(dest))
-                    except Exception as exc:
-                        print(f"    读取已有合并表失败: {exc}")
+                print(f"  跳过（已存在）: {journal}（{row['数据条数']} 条）")
                 continue
 
             merged, errors = merge_frames(files, domain, journal)
@@ -297,13 +303,14 @@ def main() -> int:
             row["去重行数"] = dropped
             row["去重列"] = id_col
             row["合并后行数"] = len(merged)
+            row["数据条数"] = len(merged)
             write_excel(merged, dest)
             row["状态"] = "完成"
             row["输出"] = str(dest)
             summary_rows.append(row)
             print(
                 f"  {journal}: {len(files)} 文件, {row['合并前行数']} -> "
-                f"{row['合并后行数']} 行"
+                f"{row['数据条数']} 条"
                 + (f"（去重 {dropped}）" if dropped else "")
             )
             if not args.no_domain:
@@ -332,6 +339,7 @@ def main() -> int:
                 "合并前行数": before,
                 "去重行数": dropped,
                 "合并后行数": len(domain_df),
+                "数据条数": len(domain_df),
                 "去重列": id_col,
                 "状态": "完成",
                 "输出": str(domain_dest),
@@ -339,7 +347,7 @@ def main() -> int:
             }
         )
         print(
-            f"  >> {domain} 总表: {before} -> {len(domain_df)} 行 -> {domain_dest.name}"
+            f"  >> {domain} 总表: {before} -> {len(domain_df)} 条 -> {domain_dest.name}"
         )
         del domain_frames, domain_df
 
@@ -363,13 +371,14 @@ def main() -> int:
                 "合并前行数": before,
                 "去重行数": dropped,
                 "合并后行数": len(all_df),
+                "数据条数": len(all_df),
                 "去重列": id_col,
                 "状态": "完成",
                 "输出": str(all_dest),
                 "错误": "",
             }
         )
-        print(f"\n九类总表: {before} -> {len(all_df)} 行 -> {all_dest}")
+        print(f"\n九类总表: {before} -> {len(all_df)} 条 -> {all_dest}")
 
     if summary_rows:
         summary = pd.DataFrame(summary_rows)
